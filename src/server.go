@@ -93,7 +93,7 @@ func StartServers(cfg *MindletConfig) error {
 				"--model", "llama3",
 				"--model_path", cfg.RamFsRoot,
 				"--max_sequence_length", fmt.Sprintf("%d", cfg.MaxSeqLength),
-				"--system_prompt", "You are a helpful AI assistant",
+				"--system_prompt", cfg.SystemPrompt,
 				"--debug",
 				"--output_dir", filepath.Join(cfg.ProjectRoot, cfg.OutputDir, cfg.LogDir)),
 		}, runLogDir, cfg.StreamLogs); err != nil {

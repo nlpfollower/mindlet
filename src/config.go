@@ -12,6 +12,7 @@ type MindletConfig struct {
 	MaxSeqLength        int
 	StreamLogs          bool
 	ModelType           ModelType
+	SystemPrompt        string
 	NumCheckpointsAhead int
 
 	// Root directories
@@ -37,6 +38,7 @@ func DefaultMindletConfig() *MindletConfig {
 		MaxSeqLength:        2048,
 		StreamLogs:          false,
 		ModelType:           Model8B,
+		SystemPrompt:        "You are a helpful AI assistant",
 		NumCheckpointsAhead: 4,
 		ProjectRoot:         "/mnt/hot_storage",
 		RamFsRoot:           "/mnt/hotter_storage",
