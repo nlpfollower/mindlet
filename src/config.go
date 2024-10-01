@@ -1,20 +1,51 @@
 package src
 
+type ModelType string
+
+const (
+	Model8B   ModelType = "8b"
+	Model70B  ModelType = "70b"
+	Model405B ModelType = "405b"
+)
+
 type MindletConfig struct {
-	PythonRoot      string
-	ProjectRoot     string
-	ChatModelDir    string
+	MaxSeqLength        int
+	StreamLogs          bool
+	ModelType           ModelType
+	NumCheckpointsAhead int
+
+	// Root directories
+	ProjectRoot string
+	RamFsRoot   string
+
+	// ProjectRoot Subdirectories
+	BootDir   string
+	OutputDir string
+	ModelPath string
+
+	// ProjectRoot/BootDir Subdirectories
+	TrainingDir     string
 	ModelManagerDir string
-	LogDir          string
-	StreamLogs      bool
+	PythonPath      string
+
+	// ProjectRoot/Output Subdirectories
+	LogDir string
 }
 
 func DefaultMindletConfig() *MindletConfig {
 	return &MindletConfig{
-		PythonRoot:      "/home/nlpfollower/anaconda3/envs/llama-3/bin/python",
-		ProjectRoot:     "/home/nlpfollower/Desktop/Web",
-		ChatModelDir:    "chat_model",
-		ModelManagerDir: "model_manager",
-		LogDir:          "",
+		MaxSeqLength:        2048,
+		StreamLogs:          false,
+		ModelType:           Model8B,
+		NumCheckpointsAhead: 4,
+		ProjectRoot:         "/mnt/hot_storage",
+		RamFsRoot:           "/mnt/hotter_storage",
+		BootDir:             "/boot",
+		OutputDir:           "/output",
+		ModelPath:           "/model",
+		TrainingDir:         "/training",
+		ModelManagerDir:     "/model_manager",
+		PythonPath:          "/inference-server-venv/bin/python",
+		LogDir:              "/kubelet_logs",
 	}
 }

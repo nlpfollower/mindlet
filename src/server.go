@@ -28,12 +28,13 @@ func StartServers(cfg *MindletConfig) error {
 		return fmt.Errorf("error setting up logging: %v", err)
 	}
 
-	if _, err := os.Stat(cfg.PythonRoot); os.IsNotExist(err) {
-		return fmt.Errorf("python executable not found at %s", cfg.PythonRoot)
+	pythonPath := filepath.Join(cfg.ProjectRoot, cfg.BootDir, cfg.PythonPath)
+	if _, err := os.Stat(pythonPath); os.IsNotExist(err) {
+		return fmt.Errorf("python executable not found at %s", pythonPath)
 	}
 
-	modelManagerPath := filepath.Join(cfg.ProjectRoot, cfg.ModelManagerDir)
-	chatModelPath := filepath.Join(cfg.ProjectRoot, cfg.ChatModelDir)
+	modelManagerPath := filepath.Join(cfg.ProjectRoot, cfg.BootDir, cfg.ModelManagerDir)
+	trainingPath := filepath.Join(cfg.ProjectRoot, cfg.BootDir, cfg.TrainingDir)
 
 	serverPath := filepath.Join(modelManagerPath, "model_server.py")
 	if _, err := os.Stat(serverPath); os.IsNotExist(err) {
@@ -52,15 +53,15 @@ func StartServers(cfg *MindletConfig) error {
 	go func() {
 		defer wg.Done()
 		if err := startServer(ctx, cfg, ServerInfo{
-			name:       cfg.ChatModelDir,
+			name:       cfg.ModelManagerDir,
 			port:       8001,
 			workingDir: modelManagerPath,
-			cmd: exec.Command(cfg.PythonRoot, "model_server.py",
-				"--type", "8b",
-				"--num-checkpoints-ahead", "2",
-				"--log-dir", "./logs",
-				"--src-dir", filepath.Join(chatModelPath, "models/Meta-Llama-3.1-8B-Instruct"),
-				"--dst-dir", "/mnt/hot_storage"),
+			cmd: exec.Command(pythonPath, "model_server.py",
+				"--type", string(cfg.ModelType),
+				"--num-checkpoints-ahead", fmt.Sprintf("%d", cfg.NumCheckpointsAhead),
+				"--log-dir", filepath.Join(cfg.ProjectRoot, cfg.OutputDir, cfg.LogDir),
+				"--src-dir", filepath.Join(cfg.ProjectRoot, cfg.ModelPath),
+				"--dst-dir", cfg.RamFsRoot),
 		}, runLogDir, cfg.StreamLogs); err != nil {
 			fmt.Printf("Error starting model_manager server: %v\n", err)
 			cancel()
@@ -85,16 +86,16 @@ func StartServers(cfg *MindletConfig) error {
 	go func() {
 		defer wg.Done()
 		if err := startServer(ctx, cfg, ServerInfo{
-			name:       cfg.ModelManagerDir,
+			name:       cfg.TrainingDir,
 			port:       8000,
-			workingDir: chatModelPath,
-			cmd: exec.Command(cfg.PythonRoot, "-m", "scripts.inference_server",
+			workingDir: trainingPath,
+			cmd: exec.Command(pythonPath, "-m", "scripts.inference_server",
 				"--model", "llama3",
-				"--model_path", "/mnt/hot_storage",
-				"--max_sequence_length", "1024",
+				"--model_path", cfg.RamFsRoot,
+				"--max_sequence_length", fmt.Sprintf("%d", cfg.MaxSeqLength),
 				"--system_prompt", "You are a helpful AI assistant",
 				"--debug",
-				"--output_dir", "output/"),
+				"--output_dir", filepath.Join(cfg.ProjectRoot, cfg.OutputDir, cfg.LogDir)),
 		}, runLogDir, cfg.StreamLogs); err != nil {
 			fmt.Printf("Error starting inference server: %v\n", err)
 			cancel()
@@ -157,8 +158,8 @@ func startServer(ctx context.Context, cfg *MindletConfig, info ServerInfo, runLo
 	info.cmd.Dir = info.workingDir
 
 	var prefix string
-	if info.name == cfg.ChatModelDir {
-		prefix = fmt.Sprintf("[%s]", cfg.ChatModelDir)
+	if info.name == cfg.TrainingDir {
+		prefix = fmt.Sprintf("[%s]", cfg.TrainingDir)
 	} else if info.name == cfg.ModelManagerDir {
 		prefix = fmt.Sprintf("[%s]", cfg.ModelManagerDir)
 	} else {

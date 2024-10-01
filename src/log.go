@@ -10,12 +10,10 @@ import (
 )
 
 func setupLogging(cfg *MindletConfig) (string, error) {
-	if cfg.LogDir == "" {
-		cfg.LogDir = filepath.Join(cfg.ProjectRoot, "logs")
-	}
+	logDir := filepath.Join(cfg.ProjectRoot, cfg.OutputDir, cfg.LogDir)
 
 	timestamp := time.Now().Format("2006-01-02-15-04-05")
-	runLogDir := filepath.Join(cfg.LogDir, fmt.Sprintf("run-%s", timestamp))
+	runLogDir := filepath.Join(logDir, fmt.Sprintf("run-%s", timestamp))
 
 	if err := os.MkdirAll(runLogDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create log directory: %v", err)
