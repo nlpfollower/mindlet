@@ -46,6 +46,6 @@ func DefaultMindletConfig() *MindletConfig {
 		TrainingDir:         "/training",
 		ModelManagerDir:     "/model_manager",
 		PythonPath:          "/inference-server-venv/bin/python",
-		LogDir:              "/kubelet_logs",
+		LogDir:              "/mindlet_logs",
 	}
 }
