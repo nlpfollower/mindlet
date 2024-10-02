@@ -10,7 +10,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -45,13 +44,7 @@ func StartServers(cfg *MindletConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create a WaitGroup to wait for all servers to finish
-	var wg sync.WaitGroup
-
-	// Start the model_manager server
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		if err := startServer(ctx, cfg, ServerInfo{
 			name:       cfg.ModelManagerDir,
 			port:       8001,
@@ -69,22 +62,8 @@ func StartServers(cfg *MindletConfig) error {
 		}
 	}()
 
-	fmt.Println("Waiting for model_manager server to initialize...")
-	for i := 0; i < 30; i++ {
-		if isServerAvailable(8001) {
-			fmt.Println("Model_manager server is available.")
-			break
-		}
-		if i == 29 {
-			return fmt.Errorf("timeout waiting for model_manager server to initialize")
-		}
-		time.Sleep(1 * time.Second)
-	}
-
 	// Start the inference server
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		if err := startServer(ctx, cfg, ServerInfo{
 			name:       cfg.TrainingDir,
 			port:       8000,
@@ -103,13 +82,13 @@ func StartServers(cfg *MindletConfig) error {
 		}
 	}()
 
-	fmt.Println("Waiting for inference server to initialize...")
-	for i := 0; i < 30; i++ {
-		if isServerAvailable(8000) {
-			fmt.Println("Inference server is available.")
+	fmt.Println("Waiting for ModelManager and Inference servers to initialize...")
+	for i := 0; i < 1000; i++ {
+		if isServerAvailable(8000) && isServerAvailable(8001) {
+			fmt.Println("ModelManager and Inference servers are available.")
 			break
 		}
-		if i == 29 {
+		if i == 999 {
 			return fmt.Errorf("timeout waiting for inference server to initialize")
 		}
 		time.Sleep(1 * time.Second)
