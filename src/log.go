@@ -1,81 +1,106 @@
 package src
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
-func setupLogging(cfg *MindletConfig) (string, error) {
-	logDir := filepath.Join(cfg.ProjectRoot, cfg.OutputDir, cfg.LogDir)
+type LogLevel string
 
+const (
+	InfoLevel  LogLevel = "INFO"
+	WarnLevel  LogLevel = "WARN"
+	ErrorLevel LogLevel = "ERROR"
+
+	infoColor  = "\033[34m" // Blue
+	warnColor  = "\033[33m" // Yellow
+	errorColor = "\033[31m" // Red
+	resetColor = "\033[0m"
+
+	defaultLogsDir = "../logs" // Default directory for logs
+)
+
+type Logger struct {
+	logFile *os.File
+	mu      sync.Mutex
+}
+
+// NewLogger creates a new logger that writes to a single file in the run directory
+func NewLogger() (*Logger, error) {
+	return NewLoggerWithDir(defaultLogsDir)
+}
+
+// NewLoggerWithDir creates a new logger that writes to a specific directory
+func NewLoggerWithDir(logDir string) (*Logger, error) {
+	// Create run directory with timestamp
 	timestamp := time.Now().Format("2006-01-02-15-04-05")
-	runLogDir := filepath.Join(logDir, fmt.Sprintf("run-%s", timestamp))
+	runDir := filepath.Join(logDir, fmt.Sprintf("run-%s", timestamp))
 
-	if err := os.MkdirAll(runLogDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create log directory: %v", err)
+	if err := os.MkdirAll(runDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create log directory: %v", err)
 	}
 
-	return runLogDir, nil
-}
-
-type MultiWriter struct {
-	writers []io.Writer
-}
-
-func (mw *MultiWriter) Write(p []byte) (n int, err error) {
-	for _, w := range mw.writers {
-		n, err = w.Write(p)
-		if err != nil {
-			return
-		}
+	// Single log file for all components
+	logPath := filepath.Join(runDir, "mindlet.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log file: %v", err)
 	}
-	return len(p), nil
+
+	return &Logger{
+		logFile: logFile,
+	}, nil
 }
 
-type PrefixedWriter struct {
-	prefix string
-	writer io.Writer
-	buffer []byte
-}
+func (l *Logger) log(level LogLevel, label string, format string, args ...interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
-func NewPrefixedWriter(prefix string, writer io.Writer) *PrefixedWriter {
-	return &PrefixedWriter{
-		prefix: prefix,
-		writer: writer,
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	message := fmt.Sprintf(format, args...)
+
+	var color string
+	switch level {
+	case InfoLevel:
+		color = infoColor
+	case WarnLevel:
+		color = warnColor
+	case ErrorLevel:
+		color = errorColor
 	}
+
+	// Colored output for terminal
+	coloredEntry := fmt.Sprintf("%s%s [%s] [%s]%s %s\n",
+		color, timestamp, level, label, resetColor, message)
+	fmt.Print(coloredEntry)
+
+	// Plain output for file
+	plainEntry := fmt.Sprintf("%s [%s] [%s] %s\n",
+		timestamp, level, label, message)
+	l.logFile.WriteString(plainEntry)
 }
 
-func (pw *PrefixedWriter) Write(p []byte) (n int, err error) {
-	n = len(p)
-	lines := bytes.Split(append(pw.buffer, p...), []byte("\n"))
-	pw.buffer = []byte{}
+func (l *Logger) Info(label string, format string, args ...interface{}) {
+	l.log(InfoLevel, label, format, args...)
+}
 
-	for i, line := range lines {
-		if i == len(lines)-1 && len(line) > 0 {
-			// This is an incomplete line, store it in the buffer
-			pw.buffer = line
-			continue
-		}
-		if len(line) > 0 || i < len(lines)-1 { // Write empty lines except for the last one
-			_, err = pw.writer.Write([]byte(pw.prefix + " "))
-			if err != nil {
-				return n, err
-			}
-			_, err = pw.writer.Write(line)
-			if err != nil {
-				return n, err
-			}
-			if i < len(lines)-1 {
-				_, err = pw.writer.Write([]byte("\n"))
-				if err != nil {
-					return n, err
-				}
-			}
-		}
+func (l *Logger) Warn(label string, format string, args ...interface{}) {
+	l.log(WarnLevel, label, format, args...)
+}
+
+func (l *Logger) Error(label string, format string, args ...interface{}) {
+	l.log(ErrorLevel, label, format, args...)
+}
+
+func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.logFile != nil {
+		return l.logFile.Close()
 	}
-	return n, nil
+	return nil
 }

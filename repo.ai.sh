@@ -1,0 +1,1 @@
+repopack --ignore "go.mod,go.sum" -o repo.ai.txt --style xml

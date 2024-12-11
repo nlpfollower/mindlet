@@ -1,5 +1,7 @@
 package src
 
+import "time"
+
 type ModelType string
 
 const (
@@ -9,11 +11,16 @@ const (
 )
 
 type MindletConfig struct {
+	Port                int
 	MaxSeqLength        int
 	StreamLogs          bool
 	ModelType           ModelType
 	SystemPrompt        string
 	NumCheckpointsAhead int
+	BatchSize           int
+	ModelTTL            time.Duration
+	ModelCleanupTick    time.Duration
+	ModelCacheTick      time.Duration
 
 	// Root directories
 	ProjectRoot string
@@ -35,11 +42,16 @@ type MindletConfig struct {
 
 func DefaultMindletConfig() *MindletConfig {
 	return &MindletConfig{
+		Port:                8001,
 		MaxSeqLength:        2048,
 		StreamLogs:          false,
 		ModelType:           Model8B,
 		SystemPrompt:        "You are a helpful AI assistant",
 		NumCheckpointsAhead: 4,
+		BatchSize:           8,
+		ModelTTL:            30 * time.Minute,
+		ModelCleanupTick:    time.Minute,
+		ModelCacheTick:      50 * time.Millisecond,
 		ProjectRoot:         "/mnt/hot_storage",
 		RamFsRoot:           "/mnt/hotter_storage",
 		BootDir:             "/boot",

@@ -21,7 +21,7 @@ func newStartCommand() *cobra.Command {
 			default:
 				return fmt.Errorf("invalid model type: %s", modelTypeStr)
 			}
-			return src.StartServers(cfg)
+			return nil
 		},
 	}
 

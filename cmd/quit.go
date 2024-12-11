@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
-	"mindlet/src"
 )
 
 func newQuitCommand() *cobra.Command {
@@ -10,7 +9,7 @@ func newQuitCommand() *cobra.Command {
 		Use:   "quit",
 		Short: "Shutdown all servers",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return src.ShutdownServers()
+			return nil
 		},
 	}
 }
