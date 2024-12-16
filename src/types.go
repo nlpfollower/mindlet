@@ -1,9 +1,12 @@
 package src
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -16,33 +19,78 @@ const (
 	InferenceConnection ConnectionType = "INFERENCE"
 )
 
-type InitialConnectionMessage struct {
-	ConnectionType ConnectionType `json:"connection_type"`
-	ClientID       string         `json:"client_id"`
+type FramedConn struct {
+	conn net.Conn
+	r    *bufio.Reader
+	w    *bufio.Writer
+}
+
+func NewFramedConn(conn net.Conn) *FramedConn {
+	return &FramedConn{
+		conn: conn,
+		r:    bufio.NewReader(conn),
+		w:    bufio.NewWriter(conn),
+	}
+}
+
+func (fc *FramedConn) WriteMessage(msg *UnifiedMessage) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+
+	// Write message length as a 4-byte big-endian integer
+	if err := binary.Write(fc.w, binary.BigEndian, uint32(len(data))); err != nil {
+		return err
+	}
+
+	// Write message data
+	if _, err := fc.w.Write(data); err != nil {
+		return err
+	}
+
+	return fc.w.Flush()
+}
+
+func (fc *FramedConn) ReadMessage() (*UnifiedMessage, error) {
+	// Read message length
+	var length uint32
+	if err := binary.Read(fc.r, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+
+	// Read message data
+	data := make([]byte, length)
+	if _, err := io.ReadFull(fc.r, data); err != nil {
+		return nil, err
+	}
+
+	var msg UnifiedMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		return nil, err
+	}
+
+	return &msg, nil
 }
 
 type Connection struct {
-	conn     net.Conn
+	framed   *FramedConn
 	connType ConnectionType
-	mu       sync.Mutex
 }
 
-func (c *Connection) Send(msg interface{}) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return json.NewEncoder(c.conn).Encode(msg)
-}
-
-func (c *Connection) Receive() (*WrappedRequest, error) {
-	var wrapped *WrappedRequest
-	if err := json.NewDecoder(c.conn).Decode(&wrapped); err != nil {
-		return nil, err
+func NewConnection(framed *FramedConn, connType ConnectionType) *Connection {
+	return &Connection{
+		framed:   framed,
+		connType: connType,
 	}
-	return wrapped, nil
 }
 
-func (c *Connection) GetRemoteAddr() string {
-	return c.conn.RemoteAddr().String()
+func (c *Connection) Send(msg *UnifiedMessage) error {
+	return c.framed.WriteMessage(msg)
+}
+
+func (c *Connection) Receive() (*UnifiedMessage, error) {
+	return c.framed.ReadMessage()
 }
 
 type ConnectionState struct {
@@ -76,12 +124,12 @@ func (cs *ConnectionState) SetConnection(conn *Connection) error {
 	switch conn.connType {
 	case EngineConnection:
 		if cs.engineConn != nil {
-			cs.engineConn.conn.Close()
+			cs.engineConn.framed.conn.Close()
 		}
 		cs.engineConn = conn
 	case InferenceConnection:
 		if cs.inferenceConn != nil {
-			cs.inferenceConn.conn.Close()
+			cs.inferenceConn.framed.conn.Close()
 		}
 		cs.inferenceConn = conn
 	default:
@@ -97,31 +145,23 @@ func (cs *ConnectionState) ClearConnection(connType ConnectionType) {
 	switch connType {
 	case EngineConnection:
 		if cs.engineConn != nil {
-			cs.engineConn.conn.Close()
+			cs.engineConn.framed.conn.Close()
 			cs.engineConn = nil
 		}
 	case InferenceConnection:
 		if cs.inferenceConn != nil {
-			cs.inferenceConn.conn.Close()
+			cs.inferenceConn.framed.conn.Close()
 			cs.inferenceConn = nil
 		}
 	}
 }
 
-func (cs *ConnectionState) SendBlocking(ctx context.Context, connType ConnectionType, req MindletRequest) error {
+func (cs *ConnectionState) SendBlocking(ctx context.Context, connType ConnectionType, msg *UnifiedMessage) error {
 	for {
-		requestID := GenerateUUID() // or pass in a known requestID if needed
-		wrappedReq, err := NewWrappedRequest(requestID, req)
-		if err != nil {
-			return fmt.Errorf("failed to wrap request: %w", err)
-		}
-
-		// Wait for connection to be available
 		if err := cs.WaitForConnection(ctx, connType, 0); err != nil {
 			return fmt.Errorf("failed waiting for connection: %w", err)
 		}
 
-		// Get the connection under lock
 		cs.mu.RLock()
 		var conn *Connection
 		switch connType {
@@ -132,12 +172,39 @@ func (cs *ConnectionState) SendBlocking(ctx context.Context, connType Connection
 		}
 		cs.mu.RUnlock()
 
-		// Try to send the request
-		if err := conn.Send(wrappedReq); err != nil {
+		if err := conn.Send(msg); err != nil {
 			continue
 		}
 
 		return nil
+	}
+}
+
+func (cs *ConnectionState) ReceiveBlocking(ctx context.Context, connType ConnectionType) (*UnifiedMessage, error) {
+	for {
+		if err := cs.WaitForConnection(ctx, connType, 0); err != nil {
+			return nil, fmt.Errorf("failed waiting for connection: %w", err)
+		}
+
+		cs.mu.RLock()
+		var conn *Connection
+		switch connType {
+		case EngineConnection:
+			conn = cs.engineConn
+		case InferenceConnection:
+			conn = cs.inferenceConn
+		}
+		cs.mu.RUnlock()
+
+		msg, err := conn.Receive()
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			return nil, err
+		}
+
+		return msg, nil
 	}
 }
 
@@ -163,16 +230,19 @@ func (cs *ConnectionState) WaitForConnection(ctx context.Context, connType Conne
 	}
 }
 
-type RequestType string
+type ActionType string
 type ResponseType string
 type ResponseStatus string
 
 const (
-	RequestTypeLoadCheckpoint       RequestType = "LOAD_CHECKPOINT"
-	RequestTypeVolumeAttach         RequestType = "VOLUME_ATTACH"
-	RequestTypeVolumeDetach         RequestType = "VOLUME_DETACH"
-	RequestTypeInferenceStream      RequestType = "INFERENCE_STREAM"
-	RequestTypeInferenceBatchStream RequestType = "INFERENCE_BATCH_STREAM"
+	ActionTypeInitialConnection    ActionType = "INITIAL_CONNECTION"
+	ActionTypeLoadCheckpoint       ActionType = "LOAD_CHECKPOINT"
+	ActionTypeVolumeAttach         ActionType = "VOLUME_ATTACH"
+	ActionTypeVolumeDetach         ActionType = "VOLUME_DETACH"
+	ActionTypeInferenceStream      ActionType = "INFERENCE_STREAM"
+	ActionTypeInferenceBatchStream ActionType = "INFERENCE_BATCH_STREAM"
+	ActionTypeLoadModel            ActionType = "LOAD_MODEL"
+	ActionTypeError                ActionType = "ERROR"
 
 	ResponseTypeFinal  ResponseType = "FINAL"
 	ResponseTypeStream ResponseType = "STREAM"
@@ -184,30 +254,35 @@ const (
 
 // Base interfaces remain the same
 type MindletRequest interface {
-	MindletRequestType() RequestType
+	MindletRequestType() ActionType
 }
 
 type MindletResponse interface {
-	MindletResponseType() RequestType
+	MindletResponseType() ActionType
+}
+
+type InitialConnectionMessage struct {
+	ConnectionType ConnectionType `json:"connection_type"`
+	ClientID       string         `json:"client_id"`
 }
 
 // Request/Response wrappers remain the same
 type WrappedRequest struct {
 	RequestID string          `json:"request_id"`
-	Type      RequestType     `json:"type"`
+	Type      ActionType      `json:"type"`
 	Data      json.RawMessage `json:"data"`
 }
 
 type WrappedResponse struct {
 	RequestID string          `json:"request_id"`
-	Type      RequestType     `json:"type"`
+	Type      ActionType      `json:"type"`
 	Data      json.RawMessage `json:"data"`
 }
 
 // Internal request wrapper
 type Request struct {
 	RequestID    string                 `json:"request_id"`
-	Type         RequestType            `json:"type"`
+	Type         ActionType             `json:"type"`
 	ConnectionID string                 `json:"connection_id"`
 	Data         MindletRequest         `json:"data"`
 	Metadata     map[string]interface{} `json:"metadata,omitempty"`
@@ -225,8 +300,8 @@ type LoadCheckpointRequest struct {
 	Checkpoint int `json:"checkpoint"`
 }
 
-func (r *LoadCheckpointRequest) MindletRequestType() RequestType {
-	return RequestTypeLoadCheckpoint
+func (r *LoadCheckpointRequest) MindletRequestType() ActionType {
+	return ActionTypeLoadCheckpoint
 }
 
 type LoadCheckpointResponse struct {
@@ -235,8 +310,25 @@ type LoadCheckpointResponse struct {
 	Message string         `json:"message"`
 }
 
-func (r *LoadCheckpointResponse) MindletResponseType() RequestType {
-	return RequestTypeLoadCheckpoint
+func (r *LoadCheckpointResponse) MindletResponseType() ActionType {
+	return ActionTypeLoadCheckpoint
+}
+
+type LoadModelRequest struct {
+	ModelName string `json:"model_name"`
+}
+
+func (r *LoadModelRequest) MindletRequestType() ActionType {
+	return ActionTypeLoadModel
+}
+
+type LoadModelResponse struct {
+	Status  ResponseStatus `json:"status"`
+	Message string         `json:"message"`
+}
+
+func (r *LoadModelResponse) MindletResponseType() ActionType {
+	return ActionTypeLoadModel
 }
 
 type VolumeAttachRequest struct {
@@ -250,8 +342,8 @@ type ModelSpec struct {
 	Type ModelType `json:"type"`
 }
 
-func (r *VolumeAttachRequest) MindletRequestType() RequestType {
-	return RequestTypeVolumeAttach
+func (r *VolumeAttachRequest) MindletRequestType() ActionType {
+	return ActionTypeVolumeAttach
 }
 
 type VolumeAttachResponse struct {
@@ -259,16 +351,16 @@ type VolumeAttachResponse struct {
 	Message string         `json:"message"`
 }
 
-func (r *VolumeAttachResponse) MindletResponseType() RequestType {
-	return RequestTypeVolumeAttach
+func (r *VolumeAttachResponse) MindletResponseType() ActionType {
+	return ActionTypeVolumeAttach
 }
 
 type VolumeDetachRequest struct {
 	Path string `json:"path"`
 }
 
-func (r *VolumeDetachRequest) MindletRequestType() RequestType {
-	return RequestTypeVolumeDetach
+func (r *VolumeDetachRequest) MindletRequestType() ActionType {
+	return ActionTypeVolumeDetach
 }
 
 type VolumeDetachResponse struct {
@@ -276,8 +368,8 @@ type VolumeDetachResponse struct {
 	Message string         `json:"message"`
 }
 
-func (r *VolumeDetachResponse) MindletResponseType() RequestType {
-	return RequestTypeVolumeDetach
+func (r *VolumeDetachResponse) MindletResponseType() ActionType {
+	return ActionTypeVolumeDetach
 }
 
 type InferenceStreamRequest struct {
@@ -285,8 +377,8 @@ type InferenceStreamRequest struct {
 	Input   string `json:"input"`
 }
 
-func (r *InferenceStreamRequest) MindletRequestType() RequestType {
-	return RequestTypeInferenceStream
+func (r *InferenceStreamRequest) MindletRequestType() ActionType {
+	return ActionTypeInferenceStream
 }
 
 type InferenceStreamResponse struct {
@@ -295,8 +387,8 @@ type InferenceStreamResponse struct {
 	Status ResponseStatus `json:"status"`
 }
 
-func (r *InferenceStreamResponse) MindletResponseType() RequestType {
-	return RequestTypeInferenceStream
+func (r *InferenceStreamResponse) MindletResponseType() ActionType {
+	return ActionTypeInferenceStream
 }
 
 type InferenceBatchStreamRequest struct {
@@ -304,8 +396,8 @@ type InferenceBatchStreamRequest struct {
 	Requests []*InferenceStreamRequest `json:"requests"`
 }
 
-func (r *InferenceBatchStreamRequest) MindletRequestType() RequestType {
-	return RequestTypeInferenceBatchStream
+func (r *InferenceBatchStreamRequest) MindletRequestType() ActionType {
+	return ActionTypeInferenceBatchStream
 }
 
 type InferenceBatchStreamResponse struct {
@@ -315,99 +407,6 @@ type InferenceBatchStreamResponse struct {
 	Status  ResponseStatus `json:"status"`
 }
 
-func (r *InferenceBatchStreamResponse) MindletResponseType() RequestType {
-	return RequestTypeInferenceBatchStream
-}
-
-// Helper functions for wrapping/unwrapping
-func NewWrappedRequest[T MindletRequest](requestID string, req T) (*WrappedRequest, error) {
-	data, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-
-	return &WrappedRequest{
-		RequestID: requestID,
-		Type:      req.MindletRequestType(),
-		Data:      data,
-	}, nil
-}
-
-func NewWrappedResponse[T MindletResponse](requestID string, resp T) (*WrappedResponse, error) {
-	data, err := json.Marshal(resp)
-	if err != nil {
-		return nil, err
-	}
-
-	return &WrappedResponse{
-		RequestID: requestID,
-		Type:      resp.MindletResponseType(),
-		Data:      data,
-	}, nil
-}
-
-func UnwrapRequest(wrapped *WrappedRequest, connID string) (*Request, error) {
-	switch wrapped.Type {
-	case RequestTypeLoadCheckpoint:
-		var req LoadCheckpointRequest
-		if err := json.Unmarshal(wrapped.Data, &req); err != nil {
-			return nil, err
-		}
-		return &Request{
-			RequestID:    wrapped.RequestID,
-			Type:         RequestTypeLoadCheckpoint,
-			ConnectionID: connID,
-			Data:         &req,
-			CreatedAt:    time.Now(),
-		}, nil
-
-	case RequestTypeVolumeAttach:
-		var req VolumeAttachRequest
-		if err := json.Unmarshal(wrapped.Data, &req); err != nil {
-			return nil, err
-		}
-		return &Request{
-			RequestID:    wrapped.RequestID,
-			Type:         RequestTypeVolumeAttach,
-			ConnectionID: connID,
-			Data:         &req,
-			CreatedAt:    time.Now(),
-		}, nil
-
-	case RequestTypeVolumeDetach:
-		var req VolumeDetachRequest
-		if err := json.Unmarshal(wrapped.Data, &req); err != nil {
-			return nil, err
-		}
-		return &Request{
-			RequestID:    wrapped.RequestID,
-			Type:         RequestTypeVolumeDetach,
-			ConnectionID: connID,
-			Data:         &req,
-			CreatedAt:    time.Now(),
-		}, nil
-
-	case RequestTypeInferenceStream:
-		var req InferenceStreamRequest
-		if err := json.Unmarshal(wrapped.Data, &req); err != nil {
-			return nil, err
-		}
-		return &Request{
-			RequestID:    wrapped.RequestID,
-			Type:         RequestTypeInferenceStream,
-			ConnectionID: connID,
-			Data:         &req,
-			CreatedAt:    time.Now(),
-		}, nil
-	}
-
-	return nil, fmt.Errorf("unsupported request type: %s", wrapped.Type)
-}
-
-func UnwrapResponse[T MindletResponse](wrapped *WrappedResponse) (*T, error) {
-	var response T
-	if err := json.Unmarshal(wrapped.Data, &response); err != nil {
-		return nil, err
-	}
-	return &response, nil
+func (r *InferenceBatchStreamResponse) MindletResponseType() ActionType {
+	return ActionTypeInferenceBatchStream
 }

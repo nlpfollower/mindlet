@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -104,22 +105,32 @@ func (m *Mindlet) acceptConnections(ctx context.Context) {
 func (m *Mindlet) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	var initMsg InitialConnectionMessage
-	if err := json.NewDecoder(conn).Decode(&initMsg); err != nil {
-		m.logger.Error("Mindlet", "Failed to decode initial message: %v", err)
+	framedConn := NewFramedConn(conn)
+
+	initMsg, err := framedConn.ReadMessage()
+	if err != nil {
+		m.logger.Error("Mindlet", "Failed to read initial message: %v", err)
 		return
 	}
 
-	m.logger.Info("Mindlet", "Connection established: %s", initMsg.ConnectionType)
-	connection := &Connection{
-		conn:     conn,
-		connType: initMsg.ConnectionType,
+	if initMsg.Action != ActionTypeInitialConnection {
+		m.logger.Error("Mindlet", "Expected initial connection message, got: %s", initMsg.Action)
+		return
 	}
 
-	switch initMsg.ConnectionType {
+	var initData InitialConnectionMessage
+	if err := json.Unmarshal(initMsg.Data, &initData); err != nil {
+		m.logger.Error("Mindlet", "Failed to unmarshal initial connection data: %v", err)
+		return
+	}
+
+	connection := NewConnection(framedConn, initData.ConnectionType)
+
+	switch initData.ConnectionType {
 	case EngineConnection, InferenceConnection:
-		if m.connState.CheckConnection(initMsg.ConnectionType) {
-			m.logger.Error("Mindlet", "Connection already established: %s", initMsg.ConnectionType)
+		m.logger.Info("Mindlet", "Connection established: %s", initData.ConnectionType)
+		if m.connState.CheckConnection(initData.ConnectionType) {
+			m.logger.Error("Mindlet", "Connection already established: %s", initData.ConnectionType)
 			m.sendError(connection, "Connection already established")
 			return
 		}
@@ -129,146 +140,187 @@ func (m *Mindlet) handleConnection(conn net.Conn) {
 			return
 		}
 	default:
-		m.logger.Error("Mindlet", "Unknown connection type: %s", initMsg.ConnectionType)
+		m.logger.Error("Mindlet", "Unknown connection type: %s", initData.ConnectionType)
 		m.sendError(connection, "Unknown connection type")
 		return
 	}
 
-	switch initMsg.ConnectionType {
-	case EngineConnection:
-		m.handleEngineConnection(connection)
-	case InferenceConnection:
-		m.handleInferenceConnection(connection)
-	}
-}
-
-// Connection handling methods
-func (m *Mindlet) handleEngineConnection(conn *Connection) {
-	defer m.connState.ClearConnection(EngineConnection)
-
+	defer m.connState.ClearConnection(initData.ConnectionType)
 	for {
-		wrapped, err := conn.Receive()
+		msg, err := connection.Receive()
 		if err != nil {
-			m.logger.Error("Mindlet", "Engine connection lost: %v", err)
-			m.connState.ClearConnection(EngineConnection)
+			if err == io.EOF {
+				m.logger.Info("Mindlet", "Connection closed: %s", initData.ConnectionType)
+			} else {
+				m.logger.Error("Mindlet", "Failed to receive message: %v", err)
+			}
 			return
 		}
 
-		req, err := UnwrapRequest(wrapped, conn.GetRemoteAddr())
-		if err != nil {
-			m.logger.Error("Mindlet", "Failed to unwrap request: %v", err)
-			continue
-		}
-
-		switch req.Type {
-		case RequestTypeInferenceStream:
-			fmt.Println("Mindlet", "Inference stream request", req.RequestID)
-			data := req.Data.(*InferenceStreamRequest)
-			// Request inference from server and get the response channel.
-			respChan, err := m.inferenceServer.RequestInference(data, req.RequestID)
-			if err != nil {
-				m.sendError(conn, fmt.Sprintf("Failed to request inference: %v", err))
-				continue
-			}
-
-			// Stream responses back to engine
-			go func() {
-				for resp := range respChan {
-					wrappedResp, _ := NewWrappedResponse(wrapped.RequestID, resp)
-					if err := conn.Send(wrappedResp); err != nil {
-						m.logger.Error("Mindlet", "Failed to send response to engine: %v", err)
-						break
-					}
-				}
-			}()
-
-		case RequestTypeVolumeAttach:
-			m.logger.Info("Mindlet", "Volume attach request")
-			data := req.Data.(*VolumeAttachRequest)
-			if err := m.model.AttachVolume(data.Path, data.Models); err != nil {
-				m.sendError(conn, fmt.Sprintf("Failed to create model: %v", err))
-				continue
-			}
-			m.logger.Info("Mindlet", "Volume attached: %s", data.Path)
-			resp, _ := NewWrappedResponse(wrapped.RequestID, &VolumeAttachResponse{
-				Status:  ResponseStatusSuccess,
-				Message: "Volume attached",
-			})
-			if err := conn.Send(resp); err != nil {
-				m.logger.Error("Mindlet", "Failed to send response: %v", err)
-			}
-			m.logger.Info("Mindlet", "Volume attached and reply sent: %s", data.Path)
-
-		case RequestTypeVolumeDetach:
-			data := req.Data.(*VolumeDetachRequest)
-			// Handle volume detachment
-			resp, _ := NewWrappedResponse(wrapped.RequestID, &VolumeDetachResponse{
-				Status:  ResponseStatusSuccess,
-				Message: fmt.Sprintf("Volume detached: %s", data.Path),
-			})
-			if err := conn.Send(resp); err != nil {
-				m.logger.Error("Mindlet", "Failed to send response: %v", err)
-			}
-
-		default:
-			m.logger.Warn("Mindlet", "Unknown request type: %s", req.Type)
+		if err := m.HandleMessage(msg); err != nil {
+			m.logger.Error("Mindlet", "Failed to handle message: %v", err)
+			// Consider whether to send an error response here
 		}
 	}
 }
 
-func (m *Mindlet) handleInferenceConnection(conn *Connection) {
-	defer m.connState.ClearConnection(InferenceConnection)
-
-	for {
-		wrapped, err := conn.Receive()
-		if err != nil {
-			m.logger.Error("Mindlet", "Failed to receive inference message: %v", err)
-			return
-		}
-
-		switch wrapped.Type {
-		case RequestTypeInferenceBatchStream:
-			var resp InferenceBatchStreamResponse
-			if err := json.Unmarshal(wrapped.Data, &resp); err != nil {
-				m.logger.Error("Mindlet", "Failed to unmarshal inference response: %v", err)
-				continue
-			}
-
-			if err := m.inferenceServer.HandleBatchResponse(&resp); err != nil {
-				m.logger.Error("Mindlet", "Failed to handle batch response: %v", err)
-			}
-
-		case RequestTypeLoadCheckpoint:
-			var req LoadCheckpointRequest
-			if err := json.Unmarshal(wrapped.Data, &req); err != nil {
-				m.logger.Error("Mindlet", "Failed to unmarshal checkpoint request: %v", err)
-				continue
-			}
-
-			modelID := m.model.GetDefaultModelID()
-			if err := m.model.LoadCheckpoint(modelID, req.Checkpoint, false); err != nil {
-				m.sendError(conn, fmt.Sprintf("Failed to load checkpoint: %v", err))
-				continue
-			}
-
-			resp, _ := NewWrappedResponse(wrapped.RequestID, &LoadCheckpointResponse{
-				Type:    ResponseTypeFinal,
-				Status:  ResponseStatusSuccess,
-				Message: fmt.Sprintf("Checkpoint %d is loaded", req.Checkpoint),
-			})
-			if err := conn.Send(resp); err != nil {
-				m.logger.Error("Mindlet", "Failed to send response: %v", err)
-			}
-
-		default:
-			m.logger.Warn("Mindlet", "Unknown request type: %s", wrapped.Type)
-		}
+func (m *Mindlet) HandleMessage(msg *UnifiedMessage) error {
+	switch msg.Type {
+	case MessageTypeRequest:
+		return m.handleRequest(msg)
+	case MessageTypeResponse:
+		return m.handleResponse(msg)
+	default:
+		return fmt.Errorf("unknown message type: %s", msg.Type)
 	}
+}
+
+func (m *Mindlet) handleRequest(msg *UnifiedMessage) error {
+	switch msg.Action {
+	case ActionTypeInferenceStream:
+		return m.handleEngineInferenceRequest(msg)
+	case ActionTypeLoadModel:
+		return m.handleEngineLoadModelRequest(msg)
+	case ActionTypeVolumeAttach:
+		return m.handleEngineVolumeAttachRequest(msg)
+	case ActionTypeVolumeDetach:
+		return m.handleEngineVolumeDetachRequest(msg)
+	case ActionTypeLoadCheckpoint:
+		return m.handleEngineLoadCheckpointRequest(msg)
+	default:
+		return fmt.Errorf("unknown request action: %s", msg.Action)
+	}
+}
+
+func (m *Mindlet) handleResponse(msg *UnifiedMessage) error {
+	switch msg.Action {
+	case ActionTypeInferenceBatchStream:
+		return m.handleInferenceBatchResponse(msg)
+	case ActionTypeLoadModel:
+		return m.handleLoadModelResponse(msg)
+	default:
+		return fmt.Errorf("unknown response action: %s", msg.Action)
+	}
+}
+
+func (m *Mindlet) handleEngineInferenceRequest(msg *UnifiedMessage) error {
+	var req InferenceStreamRequest
+	if err := msg.UnmarshalData(&req); err != nil {
+		return err
+	}
+
+	if err := m.inferenceServer.RequestInference(&req, msg.ID); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *Mindlet) handleEngineLoadModelRequest(msg *UnifiedMessage) error {
+	var req LoadModelRequest
+	if err := msg.UnmarshalData(&req); err != nil {
+		return err
+	}
+
+	forwardMsg, err := NewRequestMessage(msg.ID, ActionTypeLoadModel, &req)
+	if err != nil {
+		return err
+	}
+
+	if err := m.connState.SendBlocking(context.Background(), InferenceConnection, forwardMsg); err != nil {
+		m.logger.Error("Mindlet", "Failed to forward load model request: %v", err)
+		return err
+	}
+
+	return nil
+}
+
+func (m *Mindlet) handleEngineVolumeAttachRequest(msg *UnifiedMessage) error {
+	var req VolumeAttachRequest
+	if err := msg.UnmarshalData(&req); err != nil {
+		return err
+	}
+
+	if err := m.model.AttachVolume(req.Path, req.Models); err != nil {
+		return err
+	}
+
+	resp, err := NewResponseMessage(msg.ID, ActionTypeVolumeAttach, ResponseStatusSuccess, &VolumeAttachResponse{
+		Status:  ResponseStatusSuccess,
+		Message: "Volume attached",
+	})
+	if err != nil {
+		return err
+	}
+
+	return m.connState.SendBlocking(context.Background(), EngineConnection, resp)
+}
+
+func (m *Mindlet) handleEngineVolumeDetachRequest(msg *UnifiedMessage) error {
+	var req VolumeDetachRequest
+	if err := msg.UnmarshalData(&req); err != nil {
+		return err
+	}
+
+	if err := m.model.DetachVolume(req.Path); err != nil {
+		return err
+	}
+
+	// Handle volume detachment
+	resp, err := NewResponseMessage(msg.ID, ActionTypeVolumeDetach, ResponseStatusSuccess, &VolumeDetachResponse{
+		Status:  ResponseStatusSuccess,
+		Message: fmt.Sprintf("Volume detached: %s", req.Path),
+	})
+	if err != nil {
+		return err
+	}
+
+	return m.connState.SendBlocking(context.Background(), EngineConnection, resp)
+}
+
+func (m *Mindlet) handleEngineLoadCheckpointRequest(msg *UnifiedMessage) error {
+	var req LoadCheckpointRequest
+	if err := msg.UnmarshalData(&req); err != nil {
+		return err
+	}
+
+	modelID := m.model.GetDefaultModelID()
+	if err := m.model.LoadCheckpoint(modelID, req.Checkpoint, false); err != nil {
+		errResp, _ := NewResponseMessage(msg.ID, ActionTypeLoadCheckpoint, ResponseStatusError, &LoadCheckpointResponse{
+			Type:    ResponseTypeFinal,
+			Status:  ResponseStatusError,
+			Message: fmt.Sprintf("Failed to load checkpoint: %v", err),
+		})
+		return m.connState.SendBlocking(context.Background(), EngineConnection, errResp)
+	}
+
+	resp, _ := NewResponseMessage(msg.ID, ActionTypeLoadCheckpoint, ResponseStatusSuccess, &LoadCheckpointResponse{
+		Type:    ResponseTypeFinal,
+		Status:  ResponseStatusSuccess,
+		Message: fmt.Sprintf("Checkpoint %d is loaded", req.Checkpoint),
+	})
+	return m.connState.SendBlocking(context.Background(), EngineConnection, resp)
+}
+
+func (m *Mindlet) handleInferenceBatchResponse(msg *UnifiedMessage) error {
+	var resp InferenceBatchStreamResponse
+	if err := msg.UnmarshalData(&resp); err != nil {
+		return err
+	}
+
+	return m.inferenceServer.HandleBatchResponse(&resp)
+}
+
+func (m *Mindlet) handleLoadModelResponse(msg *UnifiedMessage) error {
+	// Forward the response to the engine connection
+	if err := m.connState.SendBlocking(context.Background(), EngineConnection, msg); err != nil {
+		m.logger.Error("Mindlet", "Failed to forward load model response to engine: %v", err)
+	}
+
+	return nil
 }
 
 func (m *Mindlet) sendError(conn *Connection, message string) {
-	conn.Send(map[string]string{
-		"status": "error",
-		"error":  message,
-	})
+	errorMsg, _ := NewResponseMessage(GenerateUUID(), ActionTypeError, ResponseStatusError, map[string]string{"error": message})
+	conn.Send(errorMsg)
 }

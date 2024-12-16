@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"github.com/nlpfollower/deltamind/orchestration/utils"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +23,6 @@ type ModelInstance struct {
 	LoadedCheckpoints map[int]*CheckpointState
 	CreationTime      time.Time
 	LastAccessedTime  time.Time
-	mu                sync.RWMutex
 }
 
 type CheckpointState struct {
@@ -43,22 +43,24 @@ type ModelManager struct {
 	config *MindletConfig
 	logger *Logger
 	// model ID -> model instance
-	models map[string]*ModelInstance
+	models *utils.ConcurrentMap[string, *ModelInstance]
 	// volume path -> model ID -> model instance
-	volumeModels map[string]map[string]*ModelInstance
+	volumeModels *utils.ConcurrentMap[string, map[string]*ModelInstance]
 	// model ID -> last requested checkpoint
-	lastRequested map[string]int
-	done          chan struct{}
-	mu            sync.RWMutex
+	lastRequested *utils.ConcurrentMap[string, int]
+	// model ID -> mutex
+	modelMutexes *utils.ConcurrentMap[string, *sync.RWMutex]
+	done         chan struct{}
 }
 
 func NewModelManager(cfg *MindletConfig, logger *Logger) (*ModelManager, error) {
 	return &ModelManager{
 		config:        cfg,
 		logger:        logger,
-		models:        make(map[string]*ModelInstance),
-		volumeModels:  make(map[string]map[string]*ModelInstance),
-		lastRequested: make(map[string]int),
+		models:        utils.NewConcurrentMap[string, *ModelInstance](),
+		volumeModels:  utils.NewConcurrentMap[string, map[string]*ModelInstance](),
+		lastRequested: utils.NewConcurrentMap[string, int](),
+		modelMutexes:  utils.NewConcurrentMap[string, *sync.RWMutex](),
 		done:          make(chan struct{}),
 	}, nil
 }
@@ -67,6 +69,15 @@ func (m *ModelManager) Start(ctx context.Context) error {
 	go m.runModelCache(ctx)
 	go m.runModelCleanup(ctx)
 	return nil
+}
+
+func (m *ModelManager) getModelMutex(modelID string) *sync.RWMutex {
+	mutex, exists := m.modelMutexes.Get(modelID)
+	if !exists {
+		mutex = &sync.RWMutex{}
+		m.modelMutexes.Set(modelID, mutex)
+	}
+	return mutex
 }
 
 func (m *ModelManager) runModelCache(ctx context.Context) {
@@ -78,9 +89,9 @@ func (m *ModelManager) runModelCache(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.mu.RLock()
-			for modelID, lastCheckpoint := range m.lastRequested {
-				if model, exists := m.models[modelID]; exists {
+			lastRequested := m.lastRequested.ToMap()
+			for modelID, lastCheckpoint := range lastRequested {
+				if model, exists := m.models.Get(modelID); exists {
 					maxCheckpoint := getMaxCheckpoint(model.Type)
 					endCheckpoint := min(lastCheckpoint+m.config.NumCheckpointsAhead+1, maxCheckpoint)
 
@@ -91,10 +102,9 @@ func (m *ModelManager) runModelCache(ctx context.Context) {
 						}
 					}
 				} else {
-					delete(m.lastRequested, modelID)
+					m.lastRequested.Remove(modelID)
 				}
 			}
-			m.mu.RUnlock()
 		}
 	}
 }
@@ -108,49 +118,40 @@ func (m *ModelManager) runModelCleanup(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.cleanupExpiredModels()
-		}
-	}
-}
+			var expiredModels []ModelSpec
+			var volumePaths []string
 
-func (m *ModelManager) cleanupExpiredModels() {
-	var expiredModels []ModelSpec
-	var volumePaths []string
+			now := time.Now()
+			for _, model := range m.models.GetAll() {
+				mutex := m.getModelMutex(model.ID)
+				mutex.RLock()
+				if now.Sub(model.LastAccessedTime) > m.config.ModelTTL {
+					expiredModels = append(expiredModels, ModelSpec{
+						ID:   model.ID,
+						Type: model.Type,
+					})
+					volumePaths = append(volumePaths, model.VolumePath)
+				}
+				mutex.RUnlock()
+			}
 
-	m.mu.RLock()
-	now := time.Now()
-	for _, model := range m.models {
-		model.mu.RLock()
-		if now.Sub(model.LastAccessedTime) > m.config.ModelTTL {
-			expiredModels = append(expiredModels, ModelSpec{
-				ID:   model.ID,
-				Type: model.Type,
-			})
-			volumePaths = append(volumePaths, model.VolumePath)
-		}
-		model.mu.RUnlock()
-	}
-	m.mu.RUnlock()
-
-	for _, spec := range expiredModels {
-		if err := m.ScaleDownModel(spec.ID); err != nil {
-			m.logger.Error("ModelManager", "Failed to scale down model %s: %v", spec.ID, err)
+			for _, spec := range expiredModels {
+				if err := m.ScaleDownModel(spec.ID); err != nil {
+					m.logger.Error("ModelManager", "Failed to scale down model %s: %v", spec.ID, err)
+				}
+			}
 		}
 	}
 }
 
 func (m *ModelManager) AttachVolume(volumePath string, modelSpecs map[string]ModelSpec) error {
-	// Initialize volume entry if it doesn't exist
-	m.mu.Lock()
-	if _, exists := m.volumeModels[volumePath]; exists {
+	if _, exists := m.volumeModels.Get(volumePath); exists {
 		return fmt.Errorf("volume already attached: %s", volumePath)
 	}
-	m.volumeModels[volumePath] = make(map[string]*ModelInstance)
-	m.mu.Unlock()
+	m.volumeModels.Set(volumePath, make(map[string]*ModelInstance))
 
-	// Load each model specified in the request's model map.
 	for _, spec := range modelSpecs {
-		if err := m.loadModel(spec, volumePath); err != nil {
+		if err := m.LoadModel(spec, volumePath); err != nil {
 			return fmt.Errorf("failed to load model %s: %v", spec.ID, err)
 		}
 	}
@@ -159,26 +160,20 @@ func (m *ModelManager) AttachVolume(volumePath string, modelSpecs map[string]Mod
 }
 
 func (m *ModelManager) DetachVolume(volumePath string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	models, exists := m.volumeModels[volumePath]
+	models, exists := m.volumeModels.Get(volumePath)
 	if !exists {
 		return fmt.Errorf("volume not found: %s", volumePath)
 	}
 
 	var errors []string
 
-	// Delete all models associated with this volume
 	for modelName, model := range models {
 		if err := m.DeleteModel(model.ID); err != nil {
 			errors = append(errors, fmt.Sprintf("model %s: %v", modelName, err))
 		}
-		delete(m.models, model.ID)
 	}
 
-	// Remove volume entry
-	delete(m.volumeModels, volumePath)
+	m.volumeModels.Remove(volumePath)
 
 	if len(errors) > 0 {
 		return fmt.Errorf("errors deleting models: %s", strings.Join(errors, "; "))
@@ -187,11 +182,65 @@ func (m *ModelManager) DetachVolume(volumePath string) error {
 	return nil
 }
 
-func (m *ModelManager) GetModel(modelID string) (*ModelInstance, error) {
-	m.mu.RLock()
-	model, exists := m.models[modelID]
-	m.mu.RUnlock()
+func (m *ModelManager) LoadModel(spec ModelSpec, volumePath string) error {
+	mutex := m.getModelMutex(spec.ID)
+	mutex.Lock()
+	defer mutex.Unlock()
 
+	modelSrcPath := filepath.Join(volumePath, spec.ID)
+
+	// Validate model path exists
+	if _, err := os.Stat(modelSrcPath); err != nil {
+		return fmt.Errorf("model %s: %v", spec.ID, err)
+	}
+
+	// Create destination directory
+	dstDir := filepath.Join(m.config.RamFsRoot, spec.ID)
+	if err := os.MkdirAll(dstDir, 0755); err != nil {
+		return fmt.Errorf("model %s: %v", spec.ID, err)
+	}
+
+	model := &ModelInstance{
+		ID:                spec.ID,
+		Type:              spec.Type,
+		SrcDir:            modelSrcPath,
+		DstDir:            dstDir,
+		VolumePath:        volumePath,
+		LoadedCheckpoints: make(map[int]*CheckpointState),
+		CreationTime:      time.Now(),
+		LastAccessedTime:  time.Now(),
+	}
+
+	// Add to maps
+	m.models.Set(spec.ID, model)
+	if volumePath != "" {
+		volumeModels, _ := m.volumeModels.Get(volumePath)
+		if volumeModels == nil {
+			volumeModels = make(map[string]*ModelInstance)
+		}
+		volumeModels[spec.ID] = model
+		m.volumeModels.Set(volumePath, volumeModels)
+	}
+
+	// Copy non-checkpoint files
+	if err := m.copyNonCheckpointFiles(model); err != nil {
+		m.logger.Error("ModelManager", "Failed to copy non-checkpoint files: %v", err)
+		m.deleteModelNoLock(model.ID)
+		return err
+	}
+
+	// Load initial checkpoints
+	if err := m.loadCheckpointNoLock(model.ID, 0, false); err != nil {
+		m.logger.Error("ModelManager", "Failed to load initial checkpoint: %v", err)
+		m.deleteModelNoLock(model.ID)
+		return err
+	}
+
+	return nil
+}
+
+func (m *ModelManager) GetModel(modelID string) (*ModelInstance, error) {
+	model, exists := m.models.Get(modelID)
 	if !exists {
 		return nil, fmt.Errorf("model not found: %s", modelID)
 	}
@@ -199,28 +248,23 @@ func (m *ModelManager) GetModel(modelID string) (*ModelInstance, error) {
 }
 
 func (m *ModelManager) GetDefaultModelID() string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	// Return the first model ID found
-	for id := range m.models {
+	for id := range m.models.ToMap() {
 		return id
 	}
 	return ""
 }
 
 func (m *ModelManager) ScaleDownModel(modelID string) error {
-	m.mu.Lock()
-	model, exists := m.models[modelID]
+	mutex := m.getModelMutex(modelID)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	model, exists := m.models.Get(modelID)
 	if !exists {
-		m.mu.Unlock()
 		return fmt.Errorf("model not found: %s", modelID)
 	}
-	m.mu.Unlock()
 
 	maxCheckpoint := getMaxCheckpoint(model.Type)
-	model.mu.Lock()
-	defer model.mu.Unlock()
 
 	for checkpoint := m.config.NumCheckpointsAhead + 1; checkpoint < maxCheckpoint; checkpoint++ {
 		filename := fmt.Sprintf("model-%05d-of-%05d.safetensors", checkpoint+1, maxCheckpoint)
@@ -234,15 +278,20 @@ func (m *ModelManager) ScaleDownModel(modelID string) error {
 }
 
 func (m *ModelManager) DeleteModel(modelID string) error {
-	m.mu.Lock()
-	model, exists := m.models[modelID]
+	mutex := m.getModelMutex(modelID)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	return m.deleteModelNoLock(modelID)
+}
+
+func (m *ModelManager) deleteModelNoLock(modelID string) error {
+	model, exists := m.models.Get(modelID)
 	if !exists {
-		m.mu.Unlock()
 		return fmt.Errorf("model not found: %s", modelID)
 	}
-	delete(m.models, modelID)
-	delete(m.lastRequested, modelID)
-	m.mu.Unlock()
+	m.models.Remove(modelID)
+	m.lastRequested.Remove(modelID)
 
 	if err := os.RemoveAll(model.DstDir); err != nil {
 		return fmt.Errorf("failed to delete model directory: %v", err)
@@ -252,6 +301,14 @@ func (m *ModelManager) DeleteModel(modelID string) error {
 }
 
 func (m *ModelManager) LoadCheckpoint(modelID string, checkpoint int, fromCache bool) error {
+	mutex := m.getModelMutex(modelID)
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	return m.loadCheckpointNoLock(modelID, checkpoint, fromCache)
+}
+
+func (m *ModelManager) loadCheckpointNoLock(modelID string, checkpoint int, fromCache bool) error {
 	model, err := m.GetModel(modelID)
 	if err != nil {
 		return err
@@ -262,12 +319,9 @@ func (m *ModelManager) LoadCheckpoint(modelID string, checkpoint int, fromCache 
 		return fmt.Errorf("invalid checkpoint number: %d", checkpoint)
 	}
 
-	model.mu.Lock()
-	defer model.mu.Unlock()
 	if !fromCache {
-		m.mu.Lock()
-		m.lastRequested[modelID] = max(m.lastRequested[modelID], checkpoint)
-		m.mu.Unlock()
+		lastRequested, _ := m.lastRequested.Get(modelID)
+		m.lastRequested.Set(modelID, max(lastRequested, checkpoint))
 		// Update on real access
 		model.LastAccessedTime = time.Now()
 	}
@@ -307,59 +361,6 @@ func (m *ModelManager) LoadCheckpoint(modelID string, checkpoint int, fromCache 
 
 	// Update state on success
 	state.LoadState = StateLoaded
-
-	return nil
-}
-
-func (m *ModelManager) loadModel(spec ModelSpec, volumePath string) error {
-	modelSrcPath := filepath.Join(volumePath, spec.ID)
-
-	// Validate model path exists
-	if _, err := os.Stat(modelSrcPath); err != nil {
-		return fmt.Errorf("model %s: %v", spec.ID, err)
-	}
-
-	// Create destination directory
-	dstDir := filepath.Join(m.config.RamFsRoot, spec.ID)
-	if err := os.MkdirAll(dstDir, 0755); err != nil {
-		return fmt.Errorf("model %s: %v", spec.ID, err)
-	}
-
-	model := &ModelInstance{
-		ID:                spec.ID,
-		Type:              spec.Type,
-		SrcDir:            modelSrcPath,
-		DstDir:            dstDir,
-		VolumePath:        volumePath,
-		LoadedCheckpoints: make(map[int]*CheckpointState),
-		CreationTime:      time.Now(),
-		LastAccessedTime:  time.Now(),
-	}
-
-	// Add to maps under lock
-	m.mu.Lock()
-	m.models[spec.ID] = model
-	if volumePath != "" {
-		if _, exists := m.volumeModels[volumePath]; !exists {
-			m.volumeModels[volumePath] = make(map[string]*ModelInstance)
-		}
-		m.volumeModels[volumePath][spec.ID] = model
-	}
-	m.mu.Unlock()
-
-	// Copy non-checkpoint files
-	if err := m.copyNonCheckpointFiles(model); err != nil {
-		m.logger.Error("ModelManager", "Failed to copy non-checkpoint files: %v", err)
-		m.DeleteModel(model.ID)
-		return err
-	}
-
-	// Load initial checkpoints
-	if err := m.LoadCheckpoint(model.ID, 0, false); err != nil {
-		m.logger.Error("ModelManager", "Failed to load initial checkpoint: %v", err)
-		m.DeleteModel(model.ID)
-		return err
-	}
 
 	return nil
 }

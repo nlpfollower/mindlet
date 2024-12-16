@@ -29,7 +29,7 @@ func GenerateUUID() string {
 func getMaxCheckpoint(modelType ModelType) int {
 	switch modelType {
 	case Model8B:
-		return 8
+		return 4
 	case Model70B:
 		return 32
 	case Model405B:

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/require"
 	"net"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -20,8 +21,8 @@ type TestHelper struct {
 	cancel   context.CancelFunc
 }
 
-func NewTestHelper(t *testing.T) *TestHelper {
-	modelHelper := NewModelTestHelper(t)
+func NewTestHelper(t *testing.T, useMock bool) *TestHelper {
+	modelHelper := NewModelTestHelper(t, useMock)
 
 	// Create real TCP listener on random port
 	listener, err := net.Listen("tcp", ":0")
@@ -35,7 +36,12 @@ func NewTestHelper(t *testing.T) *TestHelper {
 	require.NoError(t, err)
 
 	connState := NewConnectionState()
-	llmServer := NewMockLLMServer(modelHelper.config, modelHelper.logger, connState)
+	var llmServer LLMServer
+	if useMock {
+		llmServer = NewMockLLMServer(modelHelper.config, modelHelper.logger, connState)
+	} else {
+		llmServer = NewDefaultLLMServer(modelHelper.config, modelHelper.logger)
+	}
 	inferenceServer := NewInferenceServer(modelHelper.config, modelHelper.logger, model, connState, llmServer)
 
 	mindlet := &Mindlet{
@@ -67,26 +73,25 @@ func NewTestHelper(t *testing.T) *TestHelper {
 	return helper
 }
 
-func (h *TestHelper) CreateConnection(connType ConnectionType) net.Conn {
-	// Get the actual listener address
+func (h *TestHelper) CreateConnection(connType ConnectionType) *FramedConn {
 	addr := h.listener.Addr().String()
-
-	// Create real TCP connection
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(h.t, err)
 
-	// Send initial connection message
-	initMsg := InitialConnectionMessage{
+	framedConn := NewFramedConn(conn)
+
+	initData := InitialConnectionMessage{
 		ConnectionType: connType,
 		ClientID:       "test-client",
 	}
 
-	if err := json.NewEncoder(conn).Encode(initMsg); err != nil {
-		conn.Close()
-		h.t.Fatalf("Failed to encode init message: %v", err)
-	}
+	initMsg, err := NewRequestMessage(GenerateUUID(), ActionTypeInitialConnection, initData)
+	require.NoError(h.t, err)
 
-	return conn
+	err = framedConn.WriteMessage(initMsg)
+	require.NoError(h.t, err)
+
+	return framedConn
 }
 
 func (h *TestHelper) Cleanup() {
@@ -94,8 +99,7 @@ func (h *TestHelper) Cleanup() {
 	h.listener.Close()
 }
 
-func (h *TestHelper) AttachVolume(engineConn net.Conn, models map[string]ModelSpec) error {
-	// Create all models first
+func (h *TestHelper) AttachVolume(engineConn *FramedConn, models map[string]ModelSpec) error {
 	for modelID, spec := range models {
 		h.CreateModelFiles(modelID, spec.Type)
 	}
@@ -104,14 +108,14 @@ func (h *TestHelper) AttachVolume(engineConn net.Conn, models map[string]ModelSp
 		Path:   h.volumePath,
 		Models: models,
 	}
-	wrappedAttach, _ := NewWrappedRequest("attach-req-1", attachReq)
+	msg, _ := NewRequestMessage(GenerateUUID(), ActionTypeVolumeAttach, attachReq)
 
-	if err := json.NewEncoder(engineConn).Encode(wrappedAttach); err != nil {
+	if err := engineConn.WriteMessage(msg); err != nil {
 		return fmt.Errorf("failed to send attach request: %v", err)
 	}
 
-	var attachResp WrappedResponse
-	if err := json.NewDecoder(engineConn).Decode(&attachResp); err != nil {
+	attachResp, err := engineConn.ReadMessage()
+	if err != nil {
 		return fmt.Errorf("failed to read attach response: %v", err)
 	}
 
@@ -127,6 +131,17 @@ func (h *TestHelper) AttachVolume(engineConn net.Conn, models map[string]ModelSp
 	return nil
 }
 
+func (h *TestHelper) waitForConnection(connType ConnectionType, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if h.mindlet.connState.CheckConnection(connType) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("connection %s not established within timeout", connType)
+}
+
 func validateMockResponsePattern(t *testing.T, responses []InferenceStreamResponse) {
 	require.Len(t, responses, 3, "Expected 3 responses (STREAM, STREAM, FINAL) per request")
 	require.Equal(t, ResponseTypeStream, responses[0].Type)
@@ -137,158 +152,195 @@ func validateMockResponsePattern(t *testing.T, responses []InferenceStreamRespon
 	require.Equal(t, "world!", responses[2].Text)
 }
 
-func TestMindletVolumeAttachAndInference(t *testing.T) {
-	helper := NewTestHelper(t)
+func validateReconnectResponses(t *testing.T, engineConn *FramedConn) {
+	responses := make([]InferenceStreamResponse, 0, 3)
+	for i := 0; i < 3; i++ {
+		streamResp, err := engineConn.ReadMessage()
+		require.NoError(t, err)
+		var sr InferenceStreamResponse
+		require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
+		responses = append(responses, sr)
+	}
+
+	require.Len(t, responses, 3, "Expected 3 responses")
+	require.Equal(t, ResponseTypeStream, responses[0].Type)
+	require.Equal(t, "Hello", responses[0].Text)
+	require.Equal(t, ResponseTypeStream, responses[1].Type)
+	require.Equal(t, " ", responses[1].Text)
+	require.Equal(t, ResponseTypeFinal, responses[2].Type)
+	require.Equal(t, "world!", responses[2].Text)
+}
+
+func TestMindletVolumeAttachInferenceAndDetach(t *testing.T) {
+	helper := NewTestHelper(t, true)
 	defer helper.Cleanup()
 
 	// Attach model
 	engineConn := helper.CreateConnection(EngineConnection)
+	t.Logf("Attaching volume")
 	require.NoError(t, helper.AttachVolume(engineConn, map[string]ModelSpec{
-		"test-model": {
-			ID:   "test-model",
+		"my-model": {
+			ID:   "my-model",
 			Type: Model8B,
 		},
 	}))
 
+	t.Logf("Validating model files")
 	helper.VerifyModelFiles(
-		helper.modelPaths["test-model"],
-		filepath.Join(helper.ramfsDir, "test-model"),
+		helper.modelPaths["my-model"],
+		filepath.Join(helper.ramfsDir, "my-model"),
 		false,
 	)
 
-	encoder := json.NewEncoder(engineConn)
-	decoder := json.NewDecoder(engineConn)
-
-	// First request
-	infReq1 := &InferenceStreamRequest{
-		ModelID: "test-model",
-		Input:   "Hello world!",
+	// Send LoadModel request
+	loadModelReq := &LoadModelRequest{
+		ModelName: "my-model",
 	}
-	wrappedInf1, _ := NewWrappedRequest("inf-req-1", infReq1)
-	require.NoError(t, encoder.Encode(wrappedInf1))
+	loadModelMsg, _ := NewRequestMessage(GenerateUUID(), ActionTypeLoadModel, loadModelReq)
+	require.NoError(t, engineConn.WriteMessage(loadModelMsg))
 
-	var streamResp WrappedResponse
-	var sr InferenceStreamResponse
+	// Read LoadModel response
+	loadModelResp, err := engineConn.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, MessageTypeResponse, loadModelResp.Type)
+	require.Equal(t, ActionTypeLoadModel, loadModelResp.Action)
 
-	// First chunk (STREAM) for first request
-	require.NoError(t, decoder.Decode(&streamResp))
-	require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
-	require.Equal(t, "inf-req-1", streamResp.RequestID)
-	require.Equal(t, ResponseTypeStream, sr.Type)
-	require.Equal(t, "Hello", sr.Text)
+	var loadResp LoadModelResponse
+	require.NoError(t, json.Unmarshal(loadModelResp.Data, &loadResp))
+	require.Equal(t, ResponseStatusSuccess, loadResp.Status)
+	require.Contains(t, loadResp.Message, "my-model loaded successfully")
 
-	// Now enqueue two more requests quickly to force batching
-	infReq2 := &InferenceStreamRequest{
-		ModelID: "test-model",
-		Input:   "How are you?",
-	}
-	infReq3 := &InferenceStreamRequest{
-		ModelID: "test-model",
-		Input:   "What's the weather?",
-	}
-
-	wrappedInf2, _ := NewWrappedRequest("inf-req-2", infReq2)
-	wrappedInf3, _ := NewWrappedRequest("inf-req-3", infReq3)
-
-	require.NoError(t, encoder.Encode(wrappedInf2))
-	require.NoError(t, encoder.Encode(wrappedInf3))
-
-	// Read the remaining chunks for all three requests.
-	// Each request gets 3 responses total: STREAM, STREAM, FINAL.
-	// We've already read 1 for the first request, so total expected:
-	// Request 1: 2 more responses
-	// Request 2: 3 responses
-	// Request 3: 3 responses
-	// Total to read now = 2 + 3 + 3 = 8 responses.
-
+	// Send multiple inference requests
+	numRequests := 20
+	infRequests := make([]*InferenceStreamRequest, numRequests)
+	infMsgs := make([]*UnifiedMessage, numRequests)
 	responsesByID := make(map[string][]InferenceStreamResponse)
-	responsesByID["inf-req-1"] = []InferenceStreamResponse{sr} // already have first chunk
 
-	for i := 0; i < 8; i++ {
-		require.NoError(t, decoder.Decode(&streamResp))
-		require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
-		responsesByID[streamResp.RequestID] = append(responsesByID[streamResp.RequestID], sr)
+	for i := 0; i < numRequests; i++ {
+		infRequests[i] = &InferenceStreamRequest{
+			ModelID: "my-model",
+			Input:   fmt.Sprintf("Request %d", i+1),
+		}
+		infMsgs[i], _ = NewRequestMessage(GenerateUUID(), ActionTypeInferenceStream, infRequests[i])
+		responsesByID[infMsgs[i].ID] = []InferenceStreamResponse{}
 	}
 
-	// Validate all requests got the "Hello", " ", "world!" pattern
-	validateMockResponsePattern(t, responsesByID["inf-req-1"])
-	validateMockResponsePattern(t, responsesByID["inf-req-2"])
-	validateMockResponsePattern(t, responsesByID["inf-req-3"])
+	// Send all requests
+	for _, msg := range infMsgs {
+		require.NoError(t, engineConn.WriteMessage(msg))
+	}
+
+	// Read all responses
+	responsesReceived := 0
+	totalExpectedResponses := numRequests * 3 // Each request should get 3 responses (2 STREAM, 1 FINAL)
+
+	for responsesReceived < totalExpectedResponses {
+		streamResp, err := engineConn.ReadMessage()
+		require.NoError(t, err)
+		var sr InferenceStreamResponse
+		require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
+		require.Equal(t, MessageTypeResponse, streamResp.Type)
+		require.Equal(t, ActionTypeInferenceStream, streamResp.Action)
+		responsesByID[streamResp.ID] = append(responsesByID[streamResp.ID], sr)
+		responsesReceived++
+	}
+
+	// Validate responses
+	for _, responses := range responsesByID {
+		validateMockResponsePattern(t, responses)
+	}
+
+	// Detach volume
+	detachReq := &VolumeDetachRequest{
+		Path: helper.volumePath,
+	}
+	detachMsg, _ := NewRequestMessage(GenerateUUID(), ActionTypeVolumeDetach, detachReq)
+	require.NoError(t, engineConn.WriteMessage(detachMsg))
+
+	// Read detach response
+	detachResp, err := engineConn.ReadMessage()
+	require.NoError(t, err)
+	require.Equal(t, MessageTypeResponse, detachResp.Type)
+	require.Equal(t, ActionTypeVolumeDetach, detachResp.Action)
+
+	var detachData VolumeDetachResponse
+	require.NoError(t, json.Unmarshal(detachResp.Data, &detachData))
+	require.Equal(t, ResponseStatusSuccess, detachData.Status)
+	require.Contains(t, detachData.Message, "Volume detached")
+
+	// Verify model files are removed from ramfs
+	_, err = os.Stat(filepath.Join(helper.ramfsDir, "my-model"))
+	require.True(t, os.IsNotExist(err), "Model files should be removed after detach")
 }
 
 func TestMindletReconnectEngine(t *testing.T) {
-	helper := NewTestHelper(t)
+	helper := NewTestHelper(t, true)
 	defer helper.Cleanup()
+
+	helper.mindlet.logger.Info("TestMindletReconnectEngine", "Starting test with volume path: %s", helper.volumePath)
+
+	// Create model files before attaching
+	require.NoError(t, helper.CreateModelFiles("reconnect-model", Model8B))
 
 	// 1. Connect engine and send VolumeAttachRequest
 	engineConn := helper.CreateConnection(EngineConnection)
-	encoder := json.NewEncoder(engineConn)
-	decoder := json.NewDecoder(engineConn)
 
 	attachReq := &VolumeAttachRequest{
-		Path: "/test/volume",
+		Path: helper.volumePath,
 		Models: map[string]ModelSpec{
-			"my-model": {
+			"reconnect-model": {
 				ID:   "reconnect-model",
 				Type: Model8B,
 			},
 		},
 	}
-	wrappedAttach, _ := NewWrappedRequest("attach-req-1", attachReq)
-	require.NoError(t, encoder.Encode(wrappedAttach))
+	wrappedAttach, _ := NewRequestMessage("attach-req-1", ActionTypeVolumeAttach, attachReq)
+	require.NoError(t, engineConn.WriteMessage(wrappedAttach))
 
-	var attachResp WrappedResponse
-	require.NoError(t, decoder.Decode(&attachResp))
+	attachResp, err := engineConn.ReadMessage()
+	require.NoError(t, err)
 	var attachData VolumeAttachResponse
 	require.NoError(t, json.Unmarshal(attachResp.Data, &attachData))
 	require.Equal(t, ResponseStatusSuccess, attachData.Status)
 
+	helper.mindlet.logger.Info("TestMindletReconnectEngine", "Volume attached, model files created at: %s", filepath.Join(helper.volumePath, "reconnect-model"))
+
+	// Wait for the model to be loaded
+	require.Eventually(t, func() bool {
+		model, err := helper.mindlet.model.GetModel("reconnect-model")
+		return err == nil && model != nil
+	}, 5*time.Second, 100*time.Millisecond, "Model was not loaded within the expected time")
+
 	// 2. Simulate engine disconnect by closing engineConn
-	engineConn.Close()
+	helper.mindlet.logger.Info("TestMindletReconnectEngine", "Simulating engine disconnect")
+	engineConn.conn.Close()
+
+	// Wait to ensure the connection is fully closed
+	time.Sleep(500 * time.Millisecond)
 
 	// 3. Reconnect engine
+	helper.mindlet.logger.Info("TestMindletReconnectEngine", "Reconnecting engine")
 	engineConn2 := helper.CreateConnection(EngineConnection)
-	encoder2 := json.NewEncoder(engineConn2)
-	decoder2 := json.NewDecoder(engineConn2)
 
-	// Wait a bit for Mindlet to accept and set new engine connection
-	time.Sleep(200 * time.Millisecond)
+	// Wait for the new connection to be established
+	require.NoError(t, helper.waitForConnection(EngineConnection, 5*time.Second))
+
+	// Verify model state
+	model, err := helper.mindlet.model.GetModel("reconnect-model")
+	require.NoError(t, err)
+	require.NotNil(t, model)
+	require.Equal(t, Model8B, model.Type)
+	require.NotEmpty(t, model.DstDir)
+	require.FileExists(t, filepath.Join(model.DstDir, "config.json"))
 
 	// 4. Send another inference request and verify it still works
 	infReq := &InferenceStreamRequest{
 		ModelID: "reconnect-model",
 		Input:   "Hello again!",
 	}
-	wrappedInf, _ := NewWrappedRequest("inf-req-2", infReq)
-	require.NoError(t, encoder2.Encode(wrappedInf))
+	wrappedInf, _ := NewRequestMessage("inf-req-2", ActionTypeInferenceStream, infReq)
+	require.NoError(t, engineConn2.WriteMessage(wrappedInf))
 
-	// Expect streamed responses as before
-	var streamResp WrappedResponse
-	var sr InferenceStreamResponse
-
-	require.NoError(t, decoder2.Decode(&streamResp))
-	require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
-	require.Equal(t, ResponseTypeStream, sr.Type)
-	require.Equal(t, "Hello", sr.Text)
-
-	require.NoError(t, decoder2.Decode(&streamResp))
-	require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
-	require.Equal(t, ResponseTypeStream, sr.Type)
-	require.Equal(t, " ", sr.Text)
-
-	done := make(chan struct{})
-	go func() {
-		require.NoError(t, decoder2.Decode(&streamResp))
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(1 * time.Second):
-		t.Fatal("Timed out waiting for final response after reconnect")
-	}
-
-	require.NoError(t, json.Unmarshal(streamResp.Data, &sr))
-	require.Equal(t, ResponseTypeFinal, sr.Type)
-	require.Equal(t, "world!", sr.Text)
+	// Validate responses
+	validateReconnectResponses(t, engineConn2)
 }

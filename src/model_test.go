@@ -20,24 +20,32 @@ type ModelTestHelper struct {
 	ramfsDir   string
 	volumePath string
 	modelPaths map[string]string
+	useMock    bool
 }
 
-func NewModelTestHelper(t *testing.T) *ModelTestHelper {
+func NewModelTestHelper(t *testing.T, useMock bool) *ModelTestHelper {
 	logger, err := NewLogger()
 	require.NoError(t, err)
+
+	// Create config with test paths
+	cfg := DefaultMindletConfig()
 
 	// Create temporary directories
 	tempDir, err := os.MkdirTemp("", "model-test-*")
 	require.NoError(t, err)
 
-	ramfsDir := filepath.Join(tempDir, "ramfs")
-	volumePath := filepath.Join(tempDir, "volume")
-	require.NoError(t, os.MkdirAll(ramfsDir, 0755))
-	require.NoError(t, os.MkdirAll(volumePath, 0755))
+	var ramfsDir, volumePath string
+	if useMock {
+		ramfsDir = filepath.Join(tempDir, "ramfs")
+		volumePath = filepath.Join(tempDir, "volume")
+		require.NoError(t, os.MkdirAll(ramfsDir, 0755))
+		require.NoError(t, os.MkdirAll(volumePath, 0755))
+		cfg.RamFsRoot = ramfsDir
+	} else {
+		ramfsDir = cfg.RamFsRoot
+		volumePath = cfg.ProjectRoot
+	}
 
-	// Create config with test paths
-	cfg := DefaultMindletConfig()
-	cfg.RamFsRoot = ramfsDir
 	cfg.ModelTTL = 100 * time.Millisecond // Short TTL for testing
 
 	return &ModelTestHelper{
@@ -48,6 +56,7 @@ func NewModelTestHelper(t *testing.T) *ModelTestHelper {
 		ramfsDir:   ramfsDir,
 		volumePath: volumePath,
 		modelPaths: make(map[string]string),
+		useMock:    useMock,
 	}
 }
 
@@ -57,6 +66,11 @@ func (h *ModelTestHelper) Cleanup() {
 
 // CreateModelFiles creates a mock model directory with checkpoint and non-checkpoint files
 func (h *ModelTestHelper) CreateModelFiles(modelID string, modelType ModelType) error {
+	if !h.useMock {
+		h.modelPaths[modelID] = filepath.Join(h.volumePath, modelID)
+		return nil // For real server, we don't create mock files
+	}
+
 	// Create both source and destination directories
 	srcDir := filepath.Join(h.volumePath, modelID)
 	dstDir := filepath.Join(h.ramfsDir, modelID)
@@ -96,6 +110,10 @@ func (h *ModelTestHelper) CreateModelFiles(modelID string, modelType ModelType) 
 
 // VerifyModelFiles checks if all files were correctly copied to the destination
 func (h *ModelTestHelper) VerifyModelFiles(modelDir, dstDir string, checkAll bool) {
+	if !h.useMock {
+		return // For real server, we don't verify mock files
+	}
+
 	// Check non-checkpoint files
 	nonCheckpointFiles := []string{
 		"config.json",
@@ -141,7 +159,7 @@ func (h *ModelTestHelper) VerifyCheckpointFile(dstDir string, checkpoint int, mo
 }
 
 func TestCheckpointLoading(t *testing.T) {
-	helper := NewModelTestHelper(t)
+	helper := NewModelTestHelper(t, true)
 	defer helper.Cleanup()
 
 	manager, err := NewModelManager(helper.config, helper.logger)
@@ -161,20 +179,16 @@ func TestCheckpointLoading(t *testing.T) {
 		CreationTime:      time.Now(),
 		LastAccessedTime:  time.Now(),
 	}
-	manager.models[model.ID] = model
+	manager.models.Set(model.ID, model)
 
-	// Load checkpoints sequentially
 	for i := 0; i < 3; i++ {
 		err := manager.LoadCheckpoint(model.ID, i, true)
 		require.NoError(t, err)
 
-		// Verify state
-		model.mu.RLock()
-		state := model.LoadedCheckpoints[i]
+		state, exists := model.LoadedCheckpoints[i]
+		require.True(t, exists)
 		require.Equal(t, StateLoaded, state.LoadState)
-		model.mu.RUnlock()
 
-		// Verify file
 		helper.VerifyCheckpointFile(model.DstDir, i, model.Type)
 	}
 
@@ -188,7 +202,8 @@ func TestCheckpointLoading(t *testing.T) {
 }
 
 func TestCachePreloading(t *testing.T) {
-	helper := NewModelTestHelper(t)
+	modelType := Model70B
+	helper := NewModelTestHelper(t, true)
 	defer helper.Cleanup()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -200,18 +215,18 @@ func TestCachePreloading(t *testing.T) {
 
 	modelID := "test-model"
 	modelDir := filepath.Join(helper.volumePath, modelID)
-	require.NoError(t, helper.CreateModelFiles(modelID, Model8B))
+	require.NoError(t, helper.CreateModelFiles(modelID, modelType))
 
 	model := &ModelInstance{
 		ID:                modelID,
-		Type:              Model8B,
+		Type:              modelType,
 		SrcDir:            modelDir,
 		DstDir:            filepath.Join(helper.ramfsDir, modelID),
 		LoadedCheckpoints: make(map[int]*CheckpointState),
 		CreationTime:      time.Now(),
 		LastAccessedTime:  time.Now(),
 	}
-	manager.models[model.ID] = model
+	manager.models.Set(model.ID, model)
 
 	// Load checkpoint 0 and verify cache loads 1-4
 	err = manager.LoadCheckpoint(model.ID, 0, false)
@@ -227,7 +242,6 @@ func TestCachePreloading(t *testing.T) {
 			case <-maxWait:
 				t.Fatalf("Timeout waiting for cache to load checkpoints %d-%d", start, end)
 			case <-ticker.C:
-				model.mu.RLock()
 				loaded := true
 				for i := start; i <= end; i++ {
 					state, exists := model.LoadedCheckpoints[i]
@@ -236,7 +250,6 @@ func TestCachePreloading(t *testing.T) {
 						break
 					}
 				}
-				model.mu.RUnlock()
 				if loaded {
 					return
 				}
@@ -259,7 +272,8 @@ func TestCachePreloading(t *testing.T) {
 }
 
 func TestModelCleanup(t *testing.T) {
-	helper := NewModelTestHelper(t)
+	modelType := Model70B
+	helper := NewModelTestHelper(t, true)
 	defer helper.Cleanup()
 	helper.config.ModelCleanupTick = 100 * time.Millisecond
 
@@ -272,18 +286,18 @@ func TestModelCleanup(t *testing.T) {
 
 	modelID := "test-model"
 	modelDir := filepath.Join(helper.volumePath, modelID)
-	require.NoError(t, helper.CreateModelFiles(modelID, Model8B))
+	require.NoError(t, helper.CreateModelFiles(modelID, modelType))
 
 	model := &ModelInstance{
 		ID:                modelID,
-		Type:              Model8B,
+		Type:              modelType,
 		SrcDir:            modelDir,
 		DstDir:            filepath.Join(helper.ramfsDir, modelID),
 		LoadedCheckpoints: make(map[int]*CheckpointState),
 		CreationTime:      time.Now(),
 		LastAccessedTime:  time.Now(),
 	}
-	manager.models[model.ID] = model
+	manager.models.Set(model.ID, model)
 
 	// Load several checkpoints
 	for i := 0; i < 7; i++ {
@@ -307,9 +321,8 @@ func TestModelCleanup(t *testing.T) {
 			t.Logf("Checking model %s", model.ID)
 			allCorrect := true
 
-			// Check filesystem state
 			for i := 0; i < 8; i++ {
-				checkpointFile := fmt.Sprintf("model-%05d-of-%05d.safetensors", i+1, 8)
+				checkpointFile := fmt.Sprintf("model-%05d-of-%05d.safetensors", i+1, getMaxCheckpoint(modelType))
 				path := filepath.Join(helper.ramfsDir, modelID, checkpointFile)
 				exists := true
 				if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -329,13 +342,11 @@ func TestModelCleanup(t *testing.T) {
 
 			t.Logf("Model %s cleaned up correctly", model.ID)
 
-			// Verify model manager state
 			model, err := manager.GetModel(modelID)
 			if err != nil {
 				t.Fatal("Model was completely deleted")
 			}
 
-			model.mu.RLock()
 			for i := 0; i < 8; i++ {
 				_, hasCheckpoint := model.LoadedCheckpoints[i]
 				if (i <= helper.config.NumCheckpointsAhead && !hasCheckpoint) ||
@@ -344,7 +355,6 @@ func TestModelCleanup(t *testing.T) {
 					break
 				}
 			}
-			model.mu.RUnlock()
 
 			if allCorrect {
 				t.Logf("Model %s state is correct", model.ID)

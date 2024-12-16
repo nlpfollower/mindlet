@@ -59,7 +59,7 @@ func DefaultMindletConfig() *MindletConfig {
 		ModelPath:           "/model",
 		TrainingDir:         "/training",
 		ModelManagerDir:     "/model_manager",
-		PythonPath:          "/inference-server-venv/bin/python",
+		PythonPath:          "/home/nlpfollower/anaconda3/envs/llama-3/bin/python",
 		LogDir:              "/mindlet_logs",
 	}
 }
