@@ -323,8 +323,7 @@ func (r *LoadModelRequest) MindletRequestType() ActionType {
 }
 
 type LoadModelResponse struct {
-	Status  ResponseStatus `json:"status"`
-	Message string         `json:"message"`
+	Message string `json:"message"`
 }
 
 func (r *LoadModelResponse) MindletResponseType() ActionType {

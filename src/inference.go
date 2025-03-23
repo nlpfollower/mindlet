@@ -96,7 +96,6 @@ func (s *InferenceServer) processRequests(ctx context.Context) {
 				continue
 			}
 			if s.processingBatch.Load() {
-				s.logger.Info("InferenceServer", "Already processing a batch")
 				s.requestsMu.Unlock()
 				continue
 			}
@@ -223,10 +222,8 @@ func NewDefaultLLMServer(cfg *MindletConfig, logger *Logger) *DefaultLLMServer {
 
 func (s *DefaultLLMServer) Start(ctx context.Context) error {
 	cmd := exec.Command(s.config.PythonPath, "-m", "scripts.start_llm_server",
-		"--model", string(s.config.ModelType),
+		"--model", "llama3",
 		"--model_root_dir", s.config.RamFsRoot,
-		"--max_sequence_length", fmt.Sprintf("%d", s.config.MaxSeqLength),
-		"--system_prompt", s.config.SystemPrompt,
 		"--port", fmt.Sprintf("%d", s.config.Port),
 	)
 	cmd.Dir = "/home/nlpfollower/Desktop/deltamind/chat_model"
@@ -361,7 +358,6 @@ func (s *MockLLMServer) handleMessages(conn *FramedConn) {
 			}
 			s.logger.Info("MockLLMServer", "Received LoadModelRequest for model: %s", loadReq.ModelName)
 			resp := LoadModelResponse{
-				Status:  ResponseStatusSuccess,
 				Message: fmt.Sprintf("Model %s loaded successfully", loadReq.ModelName),
 			}
 			respMsg, _ := NewResponseMessage(msg.ID, ActionTypeLoadModel, ResponseStatusSuccess, resp)

@@ -172,7 +172,7 @@ func validateReconnectResponses(t *testing.T, engineConn *FramedConn) {
 }
 
 func TestMindletVolumeAttachInferenceAndDetach(t *testing.T) {
-	helper := NewTestHelper(t, true)
+	helper := NewTestHelper(t, false)
 	defer helper.Cleanup()
 
 	// Attach model
@@ -207,7 +207,7 @@ func TestMindletVolumeAttachInferenceAndDetach(t *testing.T) {
 
 	var loadResp LoadModelResponse
 	require.NoError(t, json.Unmarshal(loadModelResp.Data, &loadResp))
-	require.Equal(t, ResponseStatusSuccess, loadResp.Status)
+	require.Equal(t, ResponseStatusSuccess, loadModelResp.Status)
 	require.Contains(t, loadResp.Message, "my-model loaded successfully")
 
 	// Send multiple inference requests

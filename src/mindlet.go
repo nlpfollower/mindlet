@@ -284,6 +284,7 @@ func (m *Mindlet) handleEngineLoadCheckpointRequest(msg *UnifiedMessage) error {
 		return err
 	}
 
+	m.logger.Info("Mindlet", "Processing load checkpoint request: %v", req)
 	modelID := m.model.GetDefaultModelID()
 	if err := m.model.LoadCheckpoint(modelID, req.Checkpoint, false); err != nil {
 		errResp, _ := NewResponseMessage(msg.ID, ActionTypeLoadCheckpoint, ResponseStatusError, &LoadCheckpointResponse{
@@ -291,7 +292,7 @@ func (m *Mindlet) handleEngineLoadCheckpointRequest(msg *UnifiedMessage) error {
 			Status:  ResponseStatusError,
 			Message: fmt.Sprintf("Failed to load checkpoint: %v", err),
 		})
-		return m.connState.SendBlocking(context.Background(), EngineConnection, errResp)
+		return m.connState.SendBlocking(context.Background(), InferenceConnection, errResp)
 	}
 
 	resp, _ := NewResponseMessage(msg.ID, ActionTypeLoadCheckpoint, ResponseStatusSuccess, &LoadCheckpointResponse{
@@ -299,7 +300,8 @@ func (m *Mindlet) handleEngineLoadCheckpointRequest(msg *UnifiedMessage) error {
 		Status:  ResponseStatusSuccess,
 		Message: fmt.Sprintf("Checkpoint %d is loaded", req.Checkpoint),
 	})
-	return m.connState.SendBlocking(context.Background(), EngineConnection, resp)
+	m.logger.Info("Mindlet", "Checkpoint loaded: %d", req.Checkpoint)
+	return m.connState.SendBlocking(context.Background(), InferenceConnection, resp)
 }
 
 func (m *Mindlet) handleInferenceBatchResponse(msg *UnifiedMessage) error {
