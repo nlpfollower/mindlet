@@ -1,0 +1,23 @@
+{
+  "model_path": "/mnt/cold/contents/models/llama3-3b",
+  "dataset_path": "/mnt/cold/contents/datasets/test",
+  "tensor_preload": {
+    "enabled": true,
+    "threads": 180,
+    "redis_host": "ip-192-168-166-160",
+    "redis_port": 6379,
+    "run_id": "train-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  },
+  "command": {
+    "base_params": "--training.dataset_type custom --training.dataset file --model.flavor 3B --training.seq_len=8192 --training.dataset_packing --training.batch_size 2 --training.dataset_mode sft",
+    "advanced_params": "--comm.init_timeout_seconds 600 --comm.train_timeout_seconds 600 --evaluation.num_samples 100 --evaluation.interval 30 --checkpoint.enable_checkpoint --training.deterministic"
+  },
+  "node_topology": {
+    "head": "ip-192-168-166-160",
+    "workers": ["ip-192-168-166-161", "ip-192-168-166-162"]
+  },
+  "output_dir": "/mnt/nfs_shared/output",
+  "rank": 0,
+  "world_size": 3,
+  "node_ip": "ip-192-168-166-160"
+}
