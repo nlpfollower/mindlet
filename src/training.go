@@ -9,21 +9,28 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
 
-// TrainingConfig defines the configuration for a training job
 type TrainingConfig struct {
-	ModelPath     string           `json:"model_path"`
-	DatasetPath   string           `json:"dataset_path"`
-	TensorPreload TensorPreloadCfg `json:"tensor_preload"`
-	Command       CommandCfg       `json:"command"`
-	NodeTopology  NodeTopologyCfg  `json:"node_topology"`
-	OutputDir     string           `json:"output_dir"`
-	Rank          int              `json:"rank"`       // Node rank in the cluster
-	WorldSize     int              `json:"world_size"` // Total nodes in the cluster
-	NodeIP        string           `json:"node_ip"`    // IP address of this node
+	ModelPath     string              `json:"model_path"`
+	DatasetPath   string              `json:"dataset_path"`
+	TokenizerPath string              `json:"tokenizer_path"`
+	TensorPreload TensorPreloadCfg    `json:"tensor_preload"`
+	TorchTitanCfg TorchTitanConfigCfg `json:"torchtitan_config"`
+	NodeTopology  NodeTopologyCfg     `json:"node_topology"`
+	OutputDir     string              `json:"output_dir"`
+	Rank          int                 `json:"rank"`
+	WorldSize     int                 `json:"world_size"`
+	NodeIP        string              `json:"node_ip"`
+}
+
+// New struct to handle TorchTitan config
+type TorchTitanConfigCfg struct {
+	ConfigPath     string   `json:"config_path"`
+	OverrideParams []string `json:"override_params"`
 }
 
 type TensorPreloadCfg struct {
@@ -31,12 +38,7 @@ type TensorPreloadCfg struct {
 	Threads   int    `json:"threads"`
 	RedisHost string `json:"redis_host"`
 	RedisPort int    `json:"redis_port"`
-	RunID     string `json:"run_id"` // Consistent run ID for all nodes
-}
-
-type CommandCfg struct {
-	BaseParams     string `json:"base_params"`
-	AdvancedParams string `json:"advanced_params"`
+	RunID     string `json:"run_id"`
 }
 
 type NodeTopologyCfg struct {
@@ -50,17 +52,65 @@ var preloaderMutex sync.Mutex
 
 // TrainingManager handles the execution of training tasks
 type TrainingManager struct {
-	config *MindletConfig
-	logger *Logger
-	runID  string
+	config          *MindletConfig
+	logger          *Logger
+	runID           string
+	scriptPath      string
+	modelLoaderPath string
+	torchtitanPath  string
 }
 
 // NewTrainingManager creates a new training manager
 func NewTrainingManager(config *MindletConfig, logger *Logger) (*TrainingManager, error) {
 	return &TrainingManager{
-		config: config,
-		logger: logger,
+		config:          config,
+		logger:          logger,
+		scriptPath:      "./scripts/run_training.sh",
+		modelLoaderPath: "../torchtitan/model_loader.py",
 	}, nil
+}
+
+func (t *TrainingManager) SetScriptPath(path string) {
+	t.scriptPath = path
+}
+
+// SetModelLoaderPath sets the path to the model_loader.py script
+func (t *TrainingManager) SetModelLoaderPath(path string) {
+	t.modelLoaderPath = path
+}
+
+// SetTorchTitanPath sets the path to the torchtitan directory
+func (t *TrainingManager) SetTorchTitanPath(path string) {
+	t.torchtitanPath = path
+}
+
+// processConfigOverrides processes the TorchTitan config override parameters and
+// replaces any templated variables with their actual values
+func processConfigOverrides(overrides []string, cfg *TrainingConfig) []string {
+	result := make([]string, 0, len(overrides))
+	for _, param := range overrides {
+		// Replace template variables
+		processed := param
+		processed = strings.ReplaceAll(processed, "${MODEL_PATH}", cfg.ModelPath)
+		processed = strings.ReplaceAll(processed, "${DATASET_PATH}", cfg.DatasetPath)
+		processed = strings.ReplaceAll(processed, "${TOKENIZER_PATH}", cfg.TokenizerPath) // Add this line
+		processed = strings.ReplaceAll(processed, "${OUTPUT_DIR}", cfg.OutputDir)
+		processed = strings.ReplaceAll(processed, "${RUN_ID}", cfg.TensorPreload.RunID)
+
+		// Handle boolean flags properly (those ending with =true or =false)
+		if strings.HasSuffix(processed, "=true") {
+			// For boolean flags that are true, just include the flag name without the =true part
+			processed = strings.TrimSuffix(processed, "=true")
+			result = append(result, processed)
+		} else if strings.HasSuffix(processed, "=false") {
+			// For boolean flags that are false, skip them entirely
+			// Do nothing - don't add to result
+		} else {
+			// For normal parameters, keep as is
+			result = append(result, processed)
+		}
+	}
+	return result
 }
 
 // LoadTrainingConfig loads a training configuration from a file
@@ -82,6 +132,9 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	if config.DatasetPath == "" {
 		return nil, fmt.Errorf("dataset_path is required")
 	}
+	if config.TokenizerPath == "" {
+		return nil, fmt.Errorf("tokenizer_path is required")
+	}
 	if config.NodeIP == "" {
 		return nil, fmt.Errorf("node_ip is required")
 	}
@@ -90,6 +143,9 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	}
 	if config.WorldSize <= 0 {
 		return nil, fmt.Errorf("world_size must be > 0")
+	}
+	if config.TorchTitanCfg.ConfigPath == "" {
+		return nil, fmt.Errorf("torchtitan_config.config_path is required")
 	}
 
 	// Set defaults if not specified
@@ -105,6 +161,18 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	if config.OutputDir == "" {
 		config.OutputDir = "/mnt/nfs_shared/output"
 	}
+
+	// Verify TorchTitan config file exists
+	if _, err := os.Stat(config.TorchTitanCfg.ConfigPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("TorchTitan config file not found: %s", config.TorchTitanCfg.ConfigPath)
+	}
+
+	// Log the configuration details
+	t.logger.Info("Training", "Using TorchTitan config file: %s", config.TorchTitanCfg.ConfigPath)
+
+	// Process the override parameters
+	processedParams := processConfigOverrides(config.TorchTitanCfg.OverrideParams, &config)
+	t.logger.Info("Training", "TorchTitan override parameters: %s", strings.Join(processedParams, " "))
 
 	return &config, nil
 }
@@ -152,11 +220,21 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		}
 	}
 
+	// Use a specific path for model_loader.py
+	modelLoaderPath := t.modelLoaderPath
+
+	// Check if the model loader exists
+	if _, err := os.Stat(modelLoaderPath); os.IsNotExist(err) {
+		return fmt.Errorf("model_loader.py not found at %s - please ensure it exists", modelLoaderPath)
+	}
+
+	t.logger.Info("Training", "Using model loader at: %s", modelLoaderPath)
+
 	// Construct the preloader command
 	preloaderMutex.Lock()
 	preloaderCmd = exec.Command(
-		"python",
-		filepath.Join(t.config.ProjectRoot, "workspace/torchtitan/model_loader.py"),
+		t.config.PythonPath,
+		modelLoaderPath,
 		trainingCfg.ModelPath,
 		"--threads", fmt.Sprintf("%d", trainingCfg.TensorPreload.Threads),
 		"--rank", fmt.Sprintf("%d", trainingCfg.Rank),
@@ -166,9 +244,6 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		"--run-id", runID,
 	)
 	preloaderMutex.Unlock()
-
-	// Use the workspace directory as working directory
-	preloaderCmd.Dir = filepath.Join(t.config.ProjectRoot, "workspace")
 
 	// Connect stdout and stderr for logging
 	stdout, err := preloaderCmd.StdoutPipe()
@@ -227,11 +302,16 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 
 // StartTraining starts the training process
 func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *TrainingConfig) error {
-	// Find the training script
-	scriptPath := filepath.Join(t.config.ProjectRoot, "scripts/run_training.sh")
+	// Find the training script - use a direct path
+	scriptPath := t.scriptPath
+
+	// Check if script exists
 	if _, err := os.Stat(scriptPath); os.IsNotExist(err) {
 		return fmt.Errorf("training script not found at %s", scriptPath)
 	}
+
+	// Process config override parameters
+	processedParams := processConfigOverrides(trainingCfg.TorchTitanCfg.OverrideParams, trainingCfg)
 
 	// Save the config to a temporary file
 	tmpConfigPath := filepath.Join(os.TempDir(), "training_config_tmp.json")
@@ -243,6 +323,44 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 		return fmt.Errorf("failed to write config file: %v", err)
 	}
 
+	// Extract Python directory to find torchrun
+	pythonDir := filepath.Dir(t.config.PythonPath)
+	torchrunPath := filepath.Join(pythonDir, "torchrun")
+
+	// Prepare a temporary script to run TorchTitan with the correct parameters
+	tmpScriptPath := filepath.Join(os.TempDir(), "run_torchtitan_tmp.sh")
+	torchtitanCmd := fmt.Sprintf(`#!/bin/bash
+set -e
+
+# Export environment variables
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export NCCL_DEBUG=WARN
+export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
+export NCCL_IB_DISABLE=1
+
+# Change to TorchTitan directory - use the path from configuration
+cd %s
+
+# Run torchrun with the config and overrides
+# Use the full path to torchrun from the same environment as Python
+%s \
+    --nproc_per_node=1 \
+    --nnodes="%d" \
+    --node_rank="%d" \
+    --master_addr="%s" \
+    --master_port=29500 \
+    --rdzv_id=101 \
+    --rdzv_backend=c10d \
+    train.py \
+    --job.config_file="%s" \
+    %s
+`, t.torchtitanPath, torchrunPath, trainingCfg.WorldSize, trainingCfg.Rank, trainingCfg.NodeTopology.Head,
+		trainingCfg.TorchTitanCfg.ConfigPath, strings.Join(processedParams, " "))
+
+	if err := os.WriteFile(tmpScriptPath, []byte(torchtitanCmd), 0755); err != nil {
+		return fmt.Errorf("failed to write temporary script: %v", err)
+	}
+
 	// Construct command to run the training script
 	preloadFlag := "true"
 	if !trainingCfg.TensorPreload.Enabled {
@@ -251,7 +369,8 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 
 	cmd := exec.Command(scriptPath,
 		"--config", tmpConfigPath,
-		"--preload", preloadFlag)
+		"--preload", preloadFlag,
+		"--script", tmpScriptPath)
 
 	// Connect stdout and stderr for logging
 	stdout, err := cmd.StdoutPipe()
@@ -307,8 +426,9 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 			}
 			preloaderMutex.Unlock()
 
-			// Clean up the temporary config file
+			// Clean up the temporary files
 			os.Remove(tmpConfigPath)
+			os.Remove(tmpScriptPath)
 
 		case <-ctx.Done():
 			t.logger.Info("Training", "Context cancelled, killing training process")
@@ -316,8 +436,9 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 				cmd.Process.Kill()
 			}
 
-			// Clean up the temporary config file
+			// Clean up the temporary files
 			os.Remove(tmpConfigPath)
+			os.Remove(tmpScriptPath)
 		}
 	}()
 

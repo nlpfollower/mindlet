@@ -1,23 +1,36 @@
 {
-  "model_path": "/mnt/cold/contents/models/llama3-3b",
-  "dataset_path": "/mnt/cold/contents/datasets/test",
+  "model_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/checkpoint/step-0",
+  "dataset_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/datasets/test",
+  "tokenizer_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/models/Llama3.2-3B-Instruct/tokenizer.model",
   "tensor_preload": {
     "enabled": true,
-    "threads": 180,
-    "redis_host": "ip-192-168-166-160",
+    "threads": 60,
+    "redis_host": "localhost",
     "redis_port": 6379,
-    "run_id": "train-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    "run_id": "train-test-2"
   },
-  "command": {
-    "base_params": "--training.dataset_type custom --training.dataset file --model.flavor 3B --training.seq_len=8192 --training.dataset_packing --training.batch_size 2 --training.dataset_mode sft",
-    "advanced_params": "--comm.init_timeout_seconds 600 --comm.train_timeout_seconds 600 --evaluation.num_samples 100 --evaluation.interval 30 --checkpoint.enable_checkpoint --training.deterministic"
+  "torchtitan_config": {
+    "config_path": "/home/nlpfollower/Desktop/deltamind/mindlet/torchtitan_config.toml",
+    "override_params": [
+      "--job.dump_folder=/home/nlpfollower/Desktop/deltamind/torchtitan/outputs",
+      "--model.tokenizer_path=${TOKENIZER_PATH}",
+      "--training.dataset_path=${DATASET_PATH}",
+      "--training.dataset_type=custom",
+      "--training.dataset=file",
+      "--training.dataset_mode=sft",
+      "--training.seq_len=8192",
+      "--training.batch_size=2",
+      "--training.dataset_packing",
+      "--checkpoint.use_tensor_preload",
+      "--checkpoint.preload_run_id=${RUN_ID}"
+    ]
   },
   "node_topology": {
-    "head": "ip-192-168-166-160",
-    "workers": ["ip-192-168-166-161", "ip-192-168-166-162"]
+    "head": "localhost",
+    "workers": []
   },
-  "output_dir": "/mnt/nfs_shared/output",
+  "output_dir": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs",
   "rank": 0,
-  "world_size": 3,
-  "node_ip": "ip-192-168-166-160"
+  "world_size": 1,
+  "node_ip": "localhost"
 }

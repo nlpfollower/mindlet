@@ -13,8 +13,13 @@ import (
 
 func newTrainCommand() *cobra.Command {
 	var (
-		configFile string
-		usePreload bool = true // Enabled by default
+		configFile      string
+		usePreload      bool   = true // Enabled by default
+		projectRoot     string        // Allow overriding the project root
+		pythonPath      string        // Allow overriding the Python path
+		scriptPath      string        // Path to run_training.sh
+		modelLoaderPath string        // Path to model_loader.py
+		torchtitanPath  string        // Path to torchtitan directory
 	)
 
 	cmd := &cobra.Command{
@@ -24,7 +29,20 @@ func newTrainCommand() *cobra.Command {
 This command loads training configuration from a JSON file and executes
 the training process with optional tensor preloading.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Create base config
 			cfg := src.DefaultMindletConfig()
+
+			// Override config with command-line flags if provided
+			if projectRoot != "" {
+				cfg.ProjectRoot = projectRoot
+			}
+
+			if pythonPath != "" {
+				cfg.PythonPath = pythonPath
+			}
+
+			// Create needed directories
+			os.MkdirAll(cfg.LogDir, 0755)
 
 			// Check if config file exists
 			if _, err := os.Stat(configFile); os.IsNotExist(err) {
@@ -35,6 +53,24 @@ the training process with optional tensor preloading.`,
 			logger, err := src.NewLogger()
 			if err != nil {
 				return fmt.Errorf("failed to create logger: %v", err)
+			}
+
+			// Log configuration for debugging
+			logger.Info("Training", "Using project root: %s", cfg.ProjectRoot)
+			logger.Info("Training", "Using Python path: %s", cfg.PythonPath)
+			logger.Info("Training", "Using log directory: %s", cfg.LogDir)
+			logger.Info("Training", "Using config file: %s", configFile)
+
+			if scriptPath != "" {
+				logger.Info("Training", "Using custom training script: %s", scriptPath)
+			}
+
+			if modelLoaderPath != "" {
+				logger.Info("Training", "Using custom model loader: %s", modelLoaderPath)
+			}
+
+			if torchtitanPath != "" {
+				logger.Info("Training", "Using custom torchtitan path: %s", torchtitanPath)
 			}
 
 			// Create training manager
@@ -52,6 +88,19 @@ the training process with optional tensor preloading.`,
 			// Set up context with cancellation for cleanup
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel() // Ensure resources are cleaned up when we exit
+
+			// Set custom paths if provided
+			if scriptPath != "" {
+				trainingManager.SetScriptPath(scriptPath)
+			}
+
+			if modelLoaderPath != "" {
+				trainingManager.SetModelLoaderPath(modelLoaderPath)
+			}
+
+			if torchtitanPath != "" {
+				trainingManager.SetTorchTitanPath(torchtitanPath)
+			}
 
 			// Start tensor preloader if enabled
 			if usePreload && trainingCfg.TensorPreload.Enabled {
@@ -97,6 +146,11 @@ the training process with optional tensor preloading.`,
 	// Add flags
 	cmd.Flags().StringVar(&configFile, "config", defaultConfigPath, "Path to training configuration file")
 	cmd.Flags().BoolVar(&usePreload, "preload", true, "Enable tensor preloading (true) or disable it (false)")
+	cmd.Flags().StringVar(&projectRoot, "project-root", "", "Override project root directory")
+	cmd.Flags().StringVar(&pythonPath, "python-path", "", "Override Python executable path")
+	cmd.Flags().StringVar(&scriptPath, "script-path", "./scripts/run_training.sh", "Path to run_training.sh script")
+	cmd.Flags().StringVar(&modelLoaderPath, "model-loader-path", "../torchtitan/model_loader.py", "Path to model_loader.py script")
+	cmd.Flags().StringVar(&torchtitanPath, "torchtitan-path", "/home/nlpfollower/Desktop/deltamind/torchtitan", "Path to torchtitan directory")
 
 	return cmd
 }

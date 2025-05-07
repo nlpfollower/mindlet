@@ -3,15 +3,17 @@
 set -e
 
 print_usage() {
-    echo "Usage: $0 [--config <config_file>] [--preload <true|false>]"
+    echo "Usage: $0 [--config <config_file>] [--preload <true|false>] [--script <script_file>]"
     echo "  --config <config_file>: Path to training configuration file"
     echo "  --preload <true|false>: Enable or disable tensor preloading (default: true)"
+    echo "  --script <script_file>: Path to a script to run the TorchTitan training"
     exit 1
 }
 
 # Parse arguments
 CONFIG_FILE=""
 PRELOAD=true
+SCRIPT_FILE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -21,6 +23,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --preload)
             PRELOAD="$2"
+            shift 2
+            ;;
+        --script)
+            SCRIPT_FILE="$2"
             shift 2
             ;;
         --help)
@@ -58,8 +64,7 @@ TENSOR_PRELOAD_THREADS=$(jq -r '.tensor_preload.threads' "$CONFIG_FILE")
 REDIS_HOST=$(jq -r '.tensor_preload.redis_host' "$CONFIG_FILE")
 REDIS_PORT=$(jq -r '.tensor_preload.redis_port' "$CONFIG_FILE")
 RUN_ID=$(jq -r '.tensor_preload.run_id' "$CONFIG_FILE")
-BASE_PARAMS=$(jq -r '.command.base_params' "$CONFIG_FILE")
-ADVANCED_PARAMS=$(jq -r '.command.advanced_params' "$CONFIG_FILE")
+TORCHTITAN_CONFIG=$(jq -r '.torchtitan_config.config_path // ""' "$CONFIG_FILE")
 RANK=$(jq -r '.rank' "$CONFIG_FILE")
 WORLD_SIZE=$(jq -r '.world_size' "$CONFIG_FILE")
 HEAD_NODE=$(jq -r '.node_topology.head' "$CONFIG_FILE")
@@ -193,14 +198,40 @@ else
 fi
 
 # Set up environment for TorchTitan
-cd "$HOME/workspace/torchtitan"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 export NCCL_DEBUG=WARN
 export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
 export NCCL_IB_DISABLE=1
 
-# Construct and run the torchrun command
+# If a script file is provided, execute it
+if [ -n "$SCRIPT_FILE" ]; then
+    if [ ! -f "$SCRIPT_FILE" ]; then
+        echo "Error: Script file '$SCRIPT_FILE' not found"
+        exit 1
+    fi
+
+    echo "Executing provided script file: $SCRIPT_FILE"
+    chmod +x "$SCRIPT_FILE"
+
+    # Run the script and capture its PID
+    "$SCRIPT_FILE" &
+    TRAIN_PID=$!
+    echo $TRAIN_PID > /tmp/training.pid
+    echo "Training started with PID $TRAIN_PID"
+
+    # Wait for the training to complete
+    wait $TRAIN_PID
+    EXIT_CODE=$?
+
+    echo "Training exited with status $EXIT_CODE"
+    exit $EXIT_CODE
+fi
+
+# If no script file is provided, run the classic way
 echo "Starting training..."
+cd "$HOME/workspace/torchtitan"
+
+# Construct and run the torchrun command
 torchrun \
     --nproc_per_node=8 \
     --nnodes="$WORLD_SIZE" \
@@ -214,8 +245,7 @@ torchrun \
     --model.tokenizer_path="$MODEL_PATH/tokenizer.model" \
     --job.dump_folder="$OUTPUT_DIR" \
     --checkpoint.use_tensor_preload \
-    --checkpoint.preload_run_id="$RUN_ID" \
-    $BASE_PARAMS $ADVANCED_PARAMS &
+    --checkpoint.preload_run_id="$RUN_ID" &
 
 TRAIN_PID=$!
 echo $TRAIN_PID > /tmp/training.pid

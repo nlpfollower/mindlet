@@ -25,17 +25,14 @@ func newStartCommand() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().IntVar(&cfg.MaxSeqLength, "max-seq-length", cfg.MaxSeqLength, "Maximum sequence length")
+	// Include only the flags that match the fields available in the simplified MindletConfig
+	cmd.Flags().IntVar(&cfg.Port, "port", cfg.Port, "Server port")
 	cmd.Flags().IntVar(&cfg.NumCheckpointsAhead, "num-checkpoints-ahead", cfg.NumCheckpointsAhead, "Number of checkpoints ahead")
-	cmd.Flags().BoolVar(&cfg.StreamLogs, "stream-logs", cfg.StreamLogs, "Stream logs from servers")
+	cmd.Flags().IntVar(&cfg.BatchSize, "batch-size", cfg.BatchSize, "Batch size for inference")
 	cmd.Flags().StringVar(&cfg.ProjectRoot, "project-root", cfg.ProjectRoot, "Project root directory")
 	cmd.Flags().StringVar(&cfg.RamFsRoot, "ramfs-root", cfg.RamFsRoot, "RamFS root directory")
-	cmd.Flags().StringVar(&cfg.BootDir, "boot-dir", cfg.BootDir, "Boot directory")
-	cmd.Flags().StringVar(&cfg.OutputDir, "output-dir", cfg.OutputDir, "Output directory")
-	cmd.Flags().StringVar(&cfg.ModelPath, "model-path", cfg.ModelPath, "Model path")
-	cmd.Flags().StringVar(&cfg.TrainingDir, "training-dir", cfg.TrainingDir, "Training directory")
-	cmd.Flags().StringVar(&cfg.ModelManagerDir, "model-manager-dir", cfg.ModelManagerDir, "Model manager directory")
 	cmd.Flags().StringVar(&cfg.LogDir, "log-dir", cfg.LogDir, "Log directory")
+	cmd.Flags().StringVar(&cfg.PythonPath, "python-path", cfg.PythonPath, "Python executable path")
 	cmd.Flags().StringVar(&modelTypeStr, "model-type", "8b", "Model type (8b, 70b, or 405b)")
 
 	return cmd

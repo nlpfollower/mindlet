@@ -14,4 +14,5 @@ func Execute() error {
 func init() {
 	rootCmd.AddCommand(newStartCommand())
 	rootCmd.AddCommand(newQuitCommand())
+	rootCmd.AddCommand(newTrainCommand())
 }
