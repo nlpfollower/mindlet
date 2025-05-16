@@ -1,7 +1,7 @@
 {
-  "model_path": "/mnt/cold/contents/dcp/llama-8b/step-0",
-  "dataset_path": "/mnt/cold/contents/datasets/test",
-  "tokenizer_path": "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
+  "model_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/checkpoint/step-0",
+  "dataset_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/datasets/test",
+  "tokenizer_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/models/Llama3.2-3B-Instruct/tokenizer.model",
   "tensor_preload": {
     "enabled": true,
     "threads": 60,
@@ -10,9 +10,9 @@
     "run_id": "train-test-2"
   },
   "torchtitan_config": {
-    "config_path": "/home/ec2-user/workspace/mindlet/torchtitan_config.toml",
+    "config_path": "/home/nlpfollower/Desktop/deltamind/mindlet/torchtitan_config.toml",
     "override_params": [
-      "--job.dump_folder=/mnt/cold/contents/outputs",
+      "--job.dump_folder=/home/nlpfollower/Desktop/deltamind/torchtitan/outputs",
       "--model.tokenizer_path=${TOKENIZER_PATH}",
       "--training.dataset_path=${DATASET_PATH}",
       "--training.dataset_type=custom",
@@ -29,7 +29,7 @@
     "head": "localhost",
     "workers": []
   },
-  "output_dir": "/mnt/cold/contents/outputs",
+  "output_dir": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs",
   "rank": 0,
   "world_size": 1,
   "node_ip": "localhost"

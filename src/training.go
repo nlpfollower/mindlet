@@ -195,7 +195,7 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 	// If this is the head node, ensure Redis is running and ready
 	if trainingCfg.Rank == 0 {
 		// Start Redis first
-		if err := ensureRedisRunning(trainingCfg.TensorPreload.RedisPort); err != nil {
+		if err := ensureRedisRunning(t.logger, trainingCfg.TensorPreload.RedisPort); err != nil {
 			return fmt.Errorf("failed to ensure Redis is running: %w", err)
 		}
 		t.logger.Info("Training", "Redis server is ready on port %d", trainingCfg.TensorPreload.RedisPort)
@@ -454,25 +454,53 @@ func processOutput(r io.Reader, logFn func(string)) {
 }
 
 // Helper function to ensure Redis is running
-func ensureRedisRunning(port int) error {
-	// Check if Redis is running
+func ensureRedisRunning(logger *Logger, port int) error {
+	// First check if Redis container already exists but is stopped
+	checkExistingCmd := exec.Command("docker", "ps", "-a", "--filter", "name=redis", "--format", "{{.Status}}")
+	output, err := checkExistingCmd.Output()
+	if err == nil && len(output) > 0 {
+		// If it exists, check if it's already running
+		statusStr := strings.TrimSpace(string(output))
+		logger.Info("Training", "Existing Redis container found with status: %s", statusStr)
+
+		if !strings.HasPrefix(statusStr, "Up") {
+			// Container exists but is not running
+			// Try to remove it first
+			logger.Info("Training", "Removing stopped Redis container...")
+			removeCmd := exec.Command("docker", "rm", "redis")
+			if removeErr := removeCmd.Run(); removeErr != nil {
+				logger.Info("Training", "Failed to remove Redis container: %v", removeErr)
+				// If we can't remove it, try to start it
+				logger.Info("Training", "Attempting to start the existing container...")
+				startCmd := exec.Command("docker", "start", "redis")
+				if startErr := startCmd.Run(); startErr != nil {
+					return fmt.Errorf("could not remove or start existing Redis container: %v", startErr)
+				}
+			}
+		}
+	}
+
+	// Check if Redis is now running
 	checkCmd := exec.Command("docker", "ps", "--filter", "name=redis", "--format", "{{.Names}}")
-	output, err := checkCmd.Output()
+	output, err = checkCmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to check Redis status: %v", err)
 	}
 
 	if len(output) == 0 {
 		// Start Redis
+		logger.Info("Training", "Starting new Redis container...")
 		startCmd := exec.Command("docker", "run", "--name", "redis", "-p", fmt.Sprintf("%d:6379", port), "-d", "redis")
-		if err := startCmd.Run(); err != nil {
-			return fmt.Errorf("failed to start Redis: %v", err)
+		startOutput, err := startCmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to start Redis: %v (output: %s)", err, string(startOutput))
 		}
 
 		// Give Redis a moment to initialize
 		time.Sleep(2 * time.Second)
 	} else {
 		// Flush Redis
+		logger.Info("Training", "Flushing existing Redis database...")
 		flushCmd := exec.Command("docker", "exec", "redis", "redis-cli", "FLUSHALL")
 		if err := flushCmd.Run(); err != nil {
 			return fmt.Errorf("failed to flush Redis: %v", err)
@@ -480,24 +508,43 @@ func ensureRedisRunning(port int) error {
 	}
 
 	// Verify Redis is actually running by attempting to connect
-	return checkRedisConnection(port)
+	return checkRedisConnection(logger, port)
 }
 
 // Helper function to check if Redis is running locally
-func checkRedisConnection(port int) error {
+func checkRedisConnection(logger *Logger, port int) error {
 	// Try to ping Redis
-	pingCmd := exec.Command("docker", "exec", "redis", "redis-cli", "ping")
-	output, err := pingCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to ping Redis: %v (output: %s)", err, string(output))
+	maxRetries := 5
+	var lastError error
+
+	for retry := 0; retry < maxRetries; retry++ {
+		pingCmd := exec.Command("docker", "exec", "redis", "redis-cli", "ping")
+		output, err := pingCmd.CombinedOutput()
+		outputStr := strings.TrimSpace(string(output))
+
+		if err != nil {
+			lastError = fmt.Errorf("failed to ping Redis (attempt %d/%d): %v (output: %s)",
+				retry+1, maxRetries, err, outputStr)
+			logger.Info("Training", "%v", lastError)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// "PONG" response indicates Redis is running
+		if outputStr != "PONG" {
+			lastError = fmt.Errorf("unexpected Redis ping response (attempt %d/%d): %s",
+				retry+1, maxRetries, outputStr)
+			logger.Info("Training", "%v", lastError)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// Success
+		logger.Info("Training", "Redis is responding correctly (PONG)")
+		return nil
 	}
 
-	// "PONG" response indicates Redis is running
-	if string(output) != "PONG\n" {
-		return fmt.Errorf("unexpected Redis ping response: %s", string(output))
-	}
-
-	return nil
+	return lastError
 }
 
 // Helper function to check if Redis is available at the specified host and port
