@@ -19,7 +19,7 @@ func getModelPath(modelName string) string {
 		return fmt.Sprintf("/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/models/%s/checkpoint", modelName)
 	}
 	// Use default paths for remote/production environment
-	return fmt.Sprintf("/mnt/cold-storage/contents/dcp/%s/checkpoint", modelName)
+	return fmt.Sprintf("/mnt/cold/contents/dcp/%s/checkpoint", modelName)
 }
 
 // Helper function to get appropriate config based on environment

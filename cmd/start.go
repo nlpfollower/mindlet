@@ -84,12 +84,12 @@ DCP checkpoints are converted to safetensors format automatically when needed.`,
 
 	// Model configuration
 	cmd.Flags().StringVar(&convertedModelsDir, "converted-models-dir", "/opt/dlami/nvme/converted_models", "Directory for converted models")
-	cmd.Flags().StringVar(&dcpModelsDir, "dcp-models-dir", "/mnt/cold-storage/contents/dcp", "Directory containing DCP checkpoints")
+	cmd.Flags().StringVar(&dcpModelsDir, "dcp-models-dir", "/mnt/cold/contents/dcp", "Directory containing DCP checkpoints")
 
 	// Conversion configuration
 	cmd.Flags().StringVar(&conversionScriptPath, "conversion-script", "/home/ec2-user/workspace/torchchat/dcp_to_safetensors.py", "Path to dcp_to_safetensors.py script")
 	cmd.Flags().StringVar(&pythonPath, "python-path", "python3", "Path to Python executable")
-	cmd.Flags().StringVar(&defaultTokenizerPath, "tokenizer-path", "/mnt/cold-storage/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model", "Default tokenizer path")
+	cmd.Flags().StringVar(&defaultTokenizerPath, "tokenizer-path", "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model", "Default tokenizer path")
 
 	return cmd
 }

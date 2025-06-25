@@ -33,10 +33,10 @@ func DefaultMindletConfig() *MindletConfig {
 		GPUMemoryUtil:        0, // 0 means use VLLM default
 		MaxModelLen:          0, // 0 means use VLLM default
 		ConvertedModelsDir:   "/opt/dlami/nvme/converted_models",
-		DCPModelsDir:         "/mnt/cold-storage/contents/dcp",
+		DCPModelsDir:         "/mnt/cold/contents/dcp",
 		ConversionScriptPath: "/home/ec2-user/workspace/torchchat/dcp_to_safetensors.py",
 		PythonPath:           "python3",
-		DefaultTokenizerPath: "/mnt/cold-storage/contents/checkpoints/Llama3.1-8B-Instruct",
+		DefaultTokenizerPath: "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct",
 	}
 }
 
