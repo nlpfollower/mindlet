@@ -19,13 +19,26 @@ func getModelPath(modelName string) string {
 		return fmt.Sprintf("/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/models/%s/checkpoint", modelName)
 	}
 	// Use default paths for remote/production environment
-	return fmt.Sprintf("/mnt/cold-storage/contents/dcp/%s", modelName)
+	return fmt.Sprintf("/mnt/cold-storage/contents/dcp/%s/checkpoint", modelName)
+}
+
+// Helper function to get appropriate config based on environment
+func getTestConfig() *MindletConfig {
+	if os.Getenv("RUN_LOCAL") != "" {
+		return LocalTestConfig()
+	}
+	// For production/remote testing, use default config but with test-specific adjustments
+	cfg := DefaultMindletConfig()
+	// Override some settings for testing
+	cfg.Port = 19090     // Use different port to avoid conflicts
+	cfg.VLLMPort = 18000 // Use different VLLM base port
+	return cfg
 }
 
 // TestMindletServerIntegration tests the full mindlet server functionality
 func TestMindletServerIntegration(t *testing.T) {
-	// Use local test config
-	cfg := LocalTestConfig()
+	// Use appropriate config based on environment
+	cfg := getTestConfig()
 
 	// Create server
 	server, err := NewMindletServer(cfg)
