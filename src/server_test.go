@@ -22,6 +22,15 @@ func getModelPath(modelName string) string {
 	return fmt.Sprintf("/mnt/cold/contents/dcp/%s/checkpoint", modelName)
 }
 
+// Helper function to get model names and sizes based on environment
+func getTestModels() (model1Name, model2Name, model1Size, model2Size string) {
+	if os.Getenv("RUN_LOCAL") != "" {
+		return "llama-8b", "llama-3b", "8B", "3B"
+	}
+	// Production uses 8B and 70B models
+	return "llama-8b", "llama-70b", "8B", "70B"
+}
+
 // Helper function to get appropriate config based on environment
 func getTestConfig() *MindletConfig {
 	if os.Getenv("RUN_LOCAL") != "" {
@@ -66,8 +75,12 @@ func TestMindletServerIntegration(t *testing.T) {
 	// Log which environment we're testing in
 	if os.Getenv("RUN_LOCAL") != "" {
 		t.Log("Running tests with LOCAL paths")
+		t.Logf("Config: Port=%d, TensorParallelSize=%d, ConvertedModelsDir=%s",
+			cfg.Port, cfg.TensorParallelSize, cfg.ConvertedModelsDir)
 	} else {
 		t.Log("Running tests with PRODUCTION paths")
+		t.Logf("Config: Port=%d, TensorParallelSize=%d, ConvertedModelsDir=%s",
+			cfg.Port, cfg.TensorParallelSize, cfg.ConvertedModelsDir)
 	}
 
 	// Run all tests
@@ -80,6 +93,7 @@ func TestMindletServerIntegration(t *testing.T) {
 		testModelAutoLoad(t, serverURL)
 	})
 
+	// Run multiple models test. In production with TensorParallelSize=8, we need sufficient GPUs
 	t.Run("MultipleModels", func(t *testing.T) {
 		// Test loading multiple models
 		testMultipleModels(t, serverURL)
@@ -95,7 +109,7 @@ func TestMindletServerIntegration(t *testing.T) {
 		if err != nil && err != context.Canceled {
 			t.Errorf("Server error: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second): // Longer timeout for production
 		t.Error("Server failed to shut down within timeout")
 	}
 }
@@ -156,12 +170,15 @@ func testModelAutoLoad(t *testing.T, serverURL string) {
 		{Role: "user", Content: "Say 'Hello, World!' and nothing else."},
 	}
 
+	// Get model info based on environment
+	model1Name, _, _, _ := getTestModels()
+
 	// Use environment-aware path
-	modelPath := getModelPath("llama-8b")
+	modelPath := getModelPath(model1Name)
 
 	t.Logf("Using model path: %s", modelPath)
 
-	result := makeInferenceRequest(t, serverURL, "llama-8b", modelPath, messages)
+	result := makeInferenceRequest(t, serverURL, model1Name, modelPath, messages)
 
 	// Verify we got a response
 	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
@@ -196,10 +213,14 @@ func testMultipleModels(t *testing.T, serverURL string) {
 		{Role: "user", Content: "Hello from test"},
 	}
 
-	// Get model paths based on environment
-	model1Path := getModelPath("llama-8b")
-	model2Path := getModelPath("llama-3b")
+	// Get model info based on environment
+	model1Name, model2Name, model1Size, model2Size := getTestModels()
 
+	// Get model paths based on environment
+	model1Path := getModelPath(model1Name)
+	model2Path := getModelPath(model2Name)
+
+	t.Logf("Testing with models: %s (%s) and %s (%s)", model1Name, model1Size, model2Name, model2Size)
 	t.Logf("Loading first model from: %s", model1Path)
 	t.Logf("Loading second model from: %s", model2Path)
 
@@ -209,18 +230,18 @@ func testMultipleModels(t *testing.T, serverURL string) {
 	t.Logf("Initial models loaded: %d", len(initialModels))
 
 	// First model might already be loaded from previous test, but VLLM should switch
-	result1 := makeInferenceRequest(t, serverURL, "llama-8b", model1Path, messages)
+	result1 := makeInferenceRequestWithSize(t, serverURL, model1Name, model1Path, model1Size, messages)
 	if _, ok := result1["choices"]; !ok {
-		t.Error("Failed to get response from llama-8b")
+		t.Errorf("Failed to get response from %s", model1Name)
 	}
 
 	// Give VLLM time to stabilize
 	time.Sleep(1 * time.Second)
 
 	// Load second model - this should stop the first VLLM and start a new one
-	result2 := makeInferenceRequestWithSize(t, serverURL, "llama-3b", model2Path, "3B", messages)
+	result2 := makeInferenceRequestWithSize(t, serverURL, model2Name, model2Path, model2Size, messages)
 	if _, ok := result2["choices"]; !ok {
-		t.Error("Failed to get response from llama-3b")
+		t.Errorf("Failed to get response from %s", model2Name)
 	}
 
 	// Wait a bit for models to fully load
@@ -247,15 +268,15 @@ func testMultipleModels(t *testing.T, serverURL string) {
 		}
 	}
 
-	if !modelIDs["llama-8b"] || !modelIDs["llama-3b"] {
-		t.Errorf("Expected both llama-8b and llama-3b to be loaded, got: %v", modelIDs)
+	if !modelIDs[model1Name] || !modelIDs[model2Name] {
+		t.Errorf("Expected both %s and %s to be loaded, got: %v", model1Name, model2Name, modelIDs)
 	}
 
 	// Check current model
 	if currentModel, ok := health["current_model"].(string); ok {
 		t.Logf("Current active model: %s", currentModel)
-		if currentModel != "llama-3b" {
-			t.Errorf("Expected current model to be llama-3b, got: %s", currentModel)
+		if currentModel != model2Name {
+			t.Errorf("Expected current model to be %s, got: %s", model2Name, currentModel)
 		}
 	}
 
@@ -276,25 +297,41 @@ func testMultipleModels(t *testing.T, serverURL string) {
 	// Verify the running VLLM server is for the current model
 	if len(vllmServers) > 0 {
 		if server, ok := vllmServers[0].(map[string]interface{}); ok {
-			if modelID, ok := server["model_id"].(string); ok && modelID != "llama-3b" {
-				t.Errorf("Expected VLLM server for llama-3b, but found: %s", modelID)
+			if modelID, ok := server["model_id"].(string); ok && modelID != model2Name {
+				t.Errorf("Expected VLLM server for %s, but found: %s", model2Name, modelID)
 			}
 		}
 	}
 
 	// Test switching back to first model
 	t.Log("Testing switch back to first model...")
-	result3 := makeInferenceRequest(t, serverURL, "llama-8b", model1Path, messages)
+	result3 := makeInferenceRequestWithSize(t, serverURL, model1Name, model1Path, model1Size, messages)
 	if _, ok := result3["choices"]; !ok {
-		t.Error("Failed to get response from llama-8b after switching back")
+		t.Errorf("Failed to get response from %s after switching back", model1Name)
 	}
 
 	// Verify VLLM switched
 	time.Sleep(1 * time.Second)
 	health = getHealth(t, serverURL)
 	if currentModel, ok := health["current_model"].(string); ok {
-		if currentModel != "llama-8b" {
-			t.Errorf("Expected current model to be llama-8b after switch, got: %s", currentModel)
+		if currentModel != model1Name {
+			t.Errorf("Expected current model to be %s after switch, got: %s", model1Name, currentModel)
+		}
+	}
+
+	// Test switching again to second model (testing multiple switches)
+	t.Log("Testing switch back to second model...")
+	result4 := makeInferenceRequestWithSize(t, serverURL, model2Name, model2Path, model2Size, messages)
+	if _, ok := result4["choices"]; !ok {
+		t.Errorf("Failed to get response from %s on second switch", model2Name)
+	}
+
+	// Verify VLLM switched again
+	time.Sleep(1 * time.Second)
+	health = getHealth(t, serverURL)
+	if currentModel, ok := health["current_model"].(string); ok {
+		if currentModel != model2Name {
+			t.Errorf("Expected current model to be %s after second switch, got: %s", model2Name, currentModel)
 		}
 	}
 
