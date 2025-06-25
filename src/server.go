@@ -47,6 +47,7 @@ func NewMindletServer(cfg *MindletConfig) (*MindletServer, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", server.handleHealth)
 	mux.HandleFunc("/api/inference", server.handleInference)
+	mux.HandleFunc("/api/inference/stream", server.handleStreamingInference)
 
 	server.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
@@ -257,6 +258,7 @@ func (s *MindletServer) handleInference(w http.ResponseWriter, r *http.Request) 
 		Messages       []Message `json:"messages"`
 		CheckpointPath string    `json:"checkpoint_path,omitempty"`
 		ModelSize      string    `json:"model_size,omitempty"`
+		MaxTokens      int       `json:"max_tokens,omitempty"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -267,6 +269,11 @@ func (s *MindletServer) handleInference(w http.ResponseWriter, r *http.Request) 
 	// Default model size if not specified
 	if req.ModelSize == "" {
 		req.ModelSize = "8B"
+	}
+
+	// Default max tokens if not specified
+	if req.MaxTokens == 0 {
+		req.MaxTokens = 300
 	}
 
 	log.Printf("Received inference request for model: %s (size: %s)", req.ModelID, req.ModelSize)
@@ -305,8 +312,7 @@ func (s *MindletServer) handleInference(w http.ResponseWriter, r *http.Request) 
 		}
 
 		// Forward the request to VLLM
-		// This is a simplified version - in production, you'd want streaming support
-		response, err := server.Forward(r.Context(), req.Messages)
+		response, err := server.Forward(r.Context(), req.Messages, req.MaxTokens)
 		if err != nil {
 			log.Printf("VLLM inference failed: %v", err)
 			if s.logger != nil {
@@ -323,6 +329,121 @@ func (s *MindletServer) handleInference(w http.ResponseWriter, r *http.Request) 
 
 	// Fallback response if VLLM is not enabled
 	http.Error(w, "Non-VLLM inference not implemented", http.StatusNotImplemented)
+}
+
+func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		ModelID        string    `json:"model_id"`
+		Messages       []Message `json:"messages"`
+		CheckpointPath string    `json:"checkpoint_path,omitempty"`
+		ModelSize      string    `json:"model_size,omitempty"`
+		MaxTokens      int       `json:"max_tokens,omitempty"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Default model size if not specified
+	if req.ModelSize == "" {
+		req.ModelSize = "8B"
+	}
+
+	// Default max tokens if not specified
+	if req.MaxTokens == 0 {
+		req.MaxTokens = 300
+	}
+
+	log.Printf("Received streaming inference request for model: %s (size: %s)", req.ModelID, req.ModelSize)
+	if s.logger != nil {
+		s.logger.Info("MindletServer", "Received streaming inference request for model: %s, checkpoint: %s, size: %s",
+			req.ModelID, req.CheckpointPath, req.ModelSize)
+	}
+
+	// Use checkpoint path from request, or construct default path
+	checkpointPath := req.CheckpointPath
+	if checkpointPath == "" {
+		checkpointPath = filepath.Join(s.config.DCPModelsDir, req.ModelID)
+	}
+
+	// Switch to the requested model
+	if err := s.switchToModel(req.ModelID, checkpointPath, req.ModelSize); err != nil {
+		log.Printf("Failed to switch to model: %v", err)
+		if s.logger != nil {
+			s.logger.Error("MindletServer", "Failed to switch to model: %v", err)
+		}
+		http.Error(w, fmt.Sprintf("Failed to switch to model: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Forward to VLLM if enabled
+	if s.config.UseVLLM {
+		server := s.vllmManager.GetServer(req.ModelID)
+		if server == nil {
+			http.Error(w, "VLLM server not running for model", http.StatusServiceUnavailable)
+			return
+		}
+
+		log.Printf("Forwarding streaming inference to VLLM server on port %d", server.Port)
+		if s.logger != nil {
+			s.logger.Info("MindletServer", "Forwarding streaming inference to VLLM server on port %d", server.Port)
+		}
+
+		// Set up SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no") // Disable Nginx buffering
+
+		// Create a flusher
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+			return
+		}
+
+		// Forward the streaming request to VLLM
+		err := server.ForwardStream(r.Context(), req.Messages, req.MaxTokens, func(chunk map[string]interface{}) error {
+			// Convert chunk to SSE format
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				return err
+			}
+
+			// Write SSE event
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+			return nil
+		})
+
+		if err != nil {
+			log.Printf("VLLM streaming inference failed: %v", err)
+			if s.logger != nil {
+				s.logger.Error("MindletServer", "VLLM streaming inference failed: %v", err)
+			}
+			// Write error as SSE event
+			errorData := map[string]interface{}{
+				"error": err.Error(),
+			}
+			data, _ := json.Marshal(errorData)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+		}
+
+		// Send done signal
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	// Fallback response if VLLM is not enabled
+	http.Error(w, "Non-VLLM streaming inference not implemented", http.StatusNotImplemented)
 }
 
 // Message represents a chat message

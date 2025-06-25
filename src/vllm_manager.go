@@ -412,8 +412,6 @@ func (m *VLLMManager) findChatTemplate() string {
 	possiblePaths := []string{
 		"/home/nlpfollower/Desktop/deltamind/vllm/examples/tool_chat_template_llama3.2_json.jinja",
 		"/home/ec2-user/workspace/vllm/examples/tool_chat_template_llama3.2_json.jinja",
-		"./tool_chat_template_llama3.2_json.jinja",
-		"/opt/vllm/templates/llama3_chat_template.jinja",
 	}
 
 	for _, path := range possiblePaths {
@@ -425,14 +423,14 @@ func (m *VLLMManager) findChatTemplate() string {
 	return ""
 }
 
-// Forward forwards inference requests to VLLM server
-func (s *VLLMServer) Forward(ctx context.Context, messages []Message) (map[string]interface{}, error) {
+// Forward forwards inference requests to VLLM server (non-streaming)
+func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens int) (map[string]interface{}, error) {
 	// Convert messages to VLLM format
 	vllmReq := map[string]interface{}{
 		"model":      "",
 		"messages":   messages,
 		"stream":     false,
-		"max_tokens": 300,
+		"max_tokens": maxTokens,
 	}
 
 	jsonData, err := json.Marshal(vllmReq)
@@ -467,4 +465,84 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message) (map[strin
 	}
 
 	return result, nil
+}
+
+// ForwardStream forwards streaming inference requests to VLLM server
+func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxTokens int, onChunk func(map[string]interface{}) error) error {
+	// Convert messages to VLLM format
+	vllmReq := map[string]interface{}{
+		"model":      "",
+		"messages":   messages,
+		"stream":     true, // Enable streaming
+		"max_tokens": maxTokens,
+	}
+
+	jsonData, err := json.Marshal(vllmReq)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Make request to VLLM
+	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("VLLM server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Read SSE stream
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("error reading stream: %w", err)
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Parse SSE data
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+
+			// Check for end of stream
+			if data == "[DONE]" {
+				break
+			}
+
+			// Parse JSON chunk
+			var chunk map[string]interface{}
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				// Log error but continue processing
+				log.Printf("Error parsing chunk: %v, data: %s", err, data)
+				continue
+			}
+
+			// Call the callback with the chunk
+			if err := onChunk(chunk); err != nil {
+				return fmt.Errorf("chunk handler error: %w", err)
+			}
+		}
+	}
+
+	return nil
 }

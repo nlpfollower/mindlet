@@ -1,6 +1,7 @@
 package src
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -97,6 +99,16 @@ func TestMindletServerIntegration(t *testing.T) {
 	t.Run("MultipleModels", func(t *testing.T) {
 		// Test loading multiple models
 		testMultipleModels(t, serverURL)
+	})
+
+	// Test streaming
+	t.Run("StreamingInference", func(t *testing.T) {
+		testStreamingInference(t, serverURL)
+	})
+
+	// Test streaming with model switching
+	t.Run("StreamingWithModelSwitch", func(t *testing.T) {
+		testStreamingWithModelSwitch(t, serverURL)
 	})
 
 	// Cleanup
@@ -338,6 +350,135 @@ func testMultipleModels(t *testing.T, serverURL string) {
 	t.Log("Multiple models test passed")
 }
 
+func testStreamingInference(t *testing.T, serverURL string) {
+	// Get model info based on environment
+	model1Name, _, _, _ := getTestModels()
+	modelPath := getModelPath(model1Name)
+
+	messages := []Message{
+		{Role: "system", Content: "You are a helpful assistant."},
+		{Role: "user", Content: "Count from 1 to 5, saying each number on a new line."},
+	}
+
+	t.Logf("Testing streaming with model: %s", model1Name)
+
+	// Collect streamed chunks
+	chunks := make([]map[string]interface{}, 0)
+	err := makeStreamingRequest(t, serverURL, model1Name, modelPath, "8B", messages, func(chunk map[string]interface{}) {
+		chunks = append(chunks, chunk)
+		// Log chunk for debugging
+		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if delta, ok := choice["delta"].(map[string]interface{}); ok {
+					if content, ok := delta["content"].(string); ok && content != "" {
+						t.Logf("Streamed content: %q", content)
+					}
+				}
+			}
+		}
+	})
+
+	if err != nil {
+		t.Fatalf("Streaming request failed: %v", err)
+	}
+
+	// Verify we got multiple chunks
+	if len(chunks) < 2 {
+		t.Errorf("Expected multiple chunks in stream, got: %d", len(chunks))
+	}
+
+	// Reconstruct full response
+	var fullContent strings.Builder
+	for _, chunk := range chunks {
+		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if delta, ok := choice["delta"].(map[string]interface{}); ok {
+					if content, ok := delta["content"].(string); ok {
+						fullContent.WriteString(content)
+					}
+				}
+			}
+		}
+	}
+
+	t.Logf("Full streamed response: %s", fullContent.String())
+	t.Log("Streaming inference test passed")
+}
+
+func testStreamingWithModelSwitch(t *testing.T, serverURL string) {
+	// Get model info based on environment
+	model1Name, model2Name, model1Size, model2Size := getTestModels()
+	model1Path := getModelPath(model1Name)
+	model2Path := getModelPath(model2Name)
+
+	messages := []Message{
+		{Role: "user", Content: "Say 'hello' and nothing else."},
+	}
+
+	t.Logf("Testing streaming with model switching between %s and %s", model1Name, model2Name)
+
+	// Stream from first model
+	chunks1 := make([]string, 0)
+	err := makeStreamingRequest(t, serverURL, model1Name, model1Path, model1Size, messages, func(chunk map[string]interface{}) {
+		if content := extractStreamContent(chunk); content != "" {
+			chunks1 = append(chunks1, content)
+		}
+	})
+
+	if err != nil {
+		t.Fatalf("Streaming request to %s failed: %v", model1Name, err)
+	}
+
+	// Verify we got response from first model
+	if len(chunks1) == 0 {
+		t.Errorf("No chunks received from %s", model1Name)
+	}
+
+	// Give time for switch
+	time.Sleep(1 * time.Second)
+
+	// Stream from second model (should trigger model switch)
+	chunks2 := make([]string, 0)
+	err = makeStreamingRequest(t, serverURL, model2Name, model2Path, model2Size, messages, func(chunk map[string]interface{}) {
+		if content := extractStreamContent(chunk); content != "" {
+			chunks2 = append(chunks2, content)
+		}
+	})
+
+	if err != nil {
+		t.Fatalf("Streaming request to %s failed: %v", model2Name, err)
+	}
+
+	// Verify we got response from second model
+	if len(chunks2) == 0 {
+		t.Errorf("No chunks received from %s", model2Name)
+	}
+
+	// Verify current model switched
+	health := getHealth(t, serverURL)
+	if currentModel, ok := health["current_model"].(string); ok {
+		if currentModel != model2Name {
+			t.Errorf("Expected current model to be %s after streaming, got: %s", model2Name, currentModel)
+		}
+	}
+
+	t.Log("Streaming with model switch test passed")
+}
+
+// Helper function to extract content from a streaming chunk
+func extractStreamContent(chunk map[string]interface{}) string {
+	if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]interface{}); ok {
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if content, ok := delta["content"].(string); ok {
+					return content
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func getHealth(t *testing.T, serverURL string) map[string]interface{} {
 	resp, err := http.Get(serverURL + "/health")
 	if err != nil {
@@ -362,6 +503,7 @@ func makeInferenceRequestWithSize(t *testing.T, serverURL, modelID, checkpointPa
 		"messages":        messages,
 		"checkpoint_path": checkpointPath,
 		"model_size":      modelSize,
+		"max_tokens":      300,
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -390,4 +532,84 @@ func makeInferenceRequestWithSize(t *testing.T, serverURL, modelID, checkpointPa
 	}
 
 	return result
+}
+
+func makeStreamingRequest(t *testing.T, serverURL, modelID, checkpointPath, modelSize string, messages []Message, onChunk func(map[string]interface{})) error {
+	reqBody := map[string]interface{}{
+		"model_id":        modelID,
+		"messages":        messages,
+		"checkpoint_path": checkpointPath,
+		"model_size":      modelSize,
+		"max_tokens":      300,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	resp, err := http.Post(
+		serverURL+"/api/inference/stream",
+		"application/json",
+		bytes.NewReader(jsonData),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to make streaming request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("streaming failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Verify we got SSE content type
+	contentType := resp.Header.Get("Content-Type")
+	if contentType != "text/event-stream" {
+		return fmt.Errorf("expected content-type text/event-stream, got: %s", contentType)
+	}
+
+	// Read SSE stream
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("error reading stream: %w", err)
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Parse SSE data
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+
+			// Check for end of stream
+			if data == "[DONE]" {
+				t.Log("Received stream termination signal")
+				break
+			}
+
+			// Parse JSON chunk
+			var chunk map[string]interface{}
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				// Check if it's an error message
+				if strings.Contains(data, "error") {
+					return fmt.Errorf("stream error: %s", data)
+				}
+				t.Logf("Warning: failed to parse chunk: %v, data: %s", err, data)
+				continue
+			}
+
+			// Call the chunk handler
+			onChunk(chunk)
+		}
+	}
+
+	return nil
 }
