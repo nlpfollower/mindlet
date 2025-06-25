@@ -38,6 +38,8 @@ type VLLMServer struct {
 	ReadyChan   chan bool
 	StartupLogs []string
 	mu          sync.Mutex
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 type VLLMInfo struct {
@@ -136,6 +138,9 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 		return fmt.Errorf("failed to start VLLM server: %w", err)
 	}
 
+	// Create context for this server
+	ctx, cancel := context.WithCancel(context.Background())
+
 	server := &VLLMServer{
 		Config:      config,
 		Process:     cmd,
@@ -143,6 +148,8 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 		Status:      "starting",
 		ReadyChan:   make(chan bool, 1),
 		StartupLogs: make([]string, 0),
+		ctx:         ctx,
+		cancel:      cancel,
 	}
 
 	m.servers[modelID] = server
@@ -150,7 +157,7 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 	// Monitor output in background
 	go m.monitorServerOutput(modelID, stdout, stderr, server)
 
-	// Monitor server startup in background
+	// Monitor server startup in background with context
 	go m.monitorServerStartup(modelID, server)
 
 	// Wait for server to be ready with timeout
@@ -166,6 +173,9 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 			m.logger.Info("VLLMManager", "VLLM server for model %s is ready", modelID)
 		}
 		return nil
+	case <-ctx.Done():
+		// Server was stopped while starting
+		return fmt.Errorf("VLLM server startup cancelled")
 	case <-time.After(5 * time.Minute):
 		// Print startup logs for debugging
 		server.mu.Lock()
@@ -177,7 +187,8 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 			log.Printf("  %s", line)
 		}
 
-		// Kill the process
+		// Cancel and kill the process
+		cancel()
 		cmd.Process.Kill()
 		delete(m.servers, modelID)
 		return fmt.Errorf("VLLM server failed to start within timeout")
@@ -189,29 +200,34 @@ func (m *VLLMManager) monitorServerOutput(modelID string, stdout, stderr io.Read
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			line := scanner.Text()
+			select {
+			case <-server.ctx.Done():
+				return
+			default:
+				line := scanner.Text()
 
-			// Store startup logs
-			server.mu.Lock()
-			if len(server.StartupLogs) < 100 { // Keep last 100 lines
-				server.StartupLogs = append(server.StartupLogs, line)
-			}
-			server.mu.Unlock()
-
-			// Check for ready indicators
-			if strings.Contains(line, "Uvicorn running on") ||
-				strings.Contains(line, "Application startup complete") ||
-				strings.Contains(line, "Started server process") {
-				select {
-				case server.ReadyChan <- true:
-				default:
+				// Store startup logs
+				server.mu.Lock()
+				if len(server.StartupLogs) < 100 {
+					server.StartupLogs = append(server.StartupLogs, line)
 				}
-			}
+				server.mu.Unlock()
 
-			if m.logger != nil {
-				m.logger.Info("VLLM-"+modelID, "stdout: %s", line)
-			} else {
-				log.Printf("VLLM[%s] stdout: %s", modelID, line)
+				// Check for ready indicators
+				if strings.Contains(line, "Uvicorn running on") ||
+					strings.Contains(line, "Application startup complete") ||
+					strings.Contains(line, "Started server process") {
+					select {
+					case server.ReadyChan <- true:
+					default:
+					}
+				}
+
+				if m.logger != nil {
+					m.logger.Info("VLLM-"+modelID, "stdout: %s", line)
+				} else {
+					log.Printf("VLLM[%s] stdout: %s", modelID, line)
+				}
 			}
 		}
 	}()
@@ -220,28 +236,33 @@ func (m *VLLMManager) monitorServerOutput(modelID string, stdout, stderr io.Read
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
-			line := scanner.Text()
+			select {
+			case <-server.ctx.Done():
+				return
+			default:
+				line := scanner.Text()
 
-			// Store startup logs
-			server.mu.Lock()
-			if len(server.StartupLogs) < 100 {
-				server.StartupLogs = append(server.StartupLogs, line)
-			}
-			server.mu.Unlock()
-
-			// Check for ready indicators in stderr too
-			if strings.Contains(line, "Uvicorn running on") ||
-				strings.Contains(line, "Application startup complete") {
-				select {
-				case server.ReadyChan <- true:
-				default:
+				// Store startup logs
+				server.mu.Lock()
+				if len(server.StartupLogs) < 100 {
+					server.StartupLogs = append(server.StartupLogs, line)
 				}
-			}
+				server.mu.Unlock()
 
-			if m.logger != nil {
-				m.logger.Info("VLLM-"+modelID, "stderr: %s", line)
-			} else {
-				log.Printf("VLLM[%s] stderr: %s", modelID, line)
+				// Check for ready indicators in stderr too
+				if strings.Contains(line, "Uvicorn running on") ||
+					strings.Contains(line, "Application startup complete") {
+					select {
+					case server.ReadyChan <- true:
+					default:
+					}
+				}
+
+				if m.logger != nil {
+					m.logger.Info("VLLM-"+modelID, "stderr: %s", line)
+				} else {
+					log.Printf("VLLM[%s] stderr: %s", modelID, line)
+				}
 			}
 		}
 	}()
@@ -254,6 +275,11 @@ func (m *VLLMManager) StopServer(modelID string) error {
 	server, exists := m.servers[modelID]
 	if !exists {
 		return fmt.Errorf("no VLLM server running for model %s", modelID)
+	}
+
+	// Cancel the context to stop all goroutines
+	if server.cancel != nil {
+		server.cancel()
 	}
 
 	if server.Process != nil && server.Process.Process != nil {
@@ -330,35 +356,55 @@ func (m *VLLMManager) monitorServerStartup(modelID string, server *VLLMServer) {
 	endpoint := fmt.Sprintf("http://%s:%d/health", server.Config.Host, server.Port)
 
 	// Wait a bit before starting health checks
-	time.Sleep(10 * time.Second)
-
-	for i := 0; i < 60; i++ { // Try for up to 5 minutes
-		resp, err := http.Get(endpoint)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				m.mu.Lock()
-				server.Status = "running"
-				m.mu.Unlock()
-
-				// Signal ready
-				select {
-				case server.ReadyChan <- true:
-				default:
-				}
-
-				log.Printf("VLLM server for model %s confirmed ready via health check", modelID)
-				return
-			}
-		}
-		time.Sleep(5 * time.Second)
+	select {
+	case <-time.After(10 * time.Second):
+	case <-server.ctx.Done():
+		return
 	}
 
-	// Server failed to start
-	m.mu.Lock()
-	server.Status = "failed"
-	m.mu.Unlock()
-	log.Printf("VLLM server for model %s failed to start", modelID)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	timeout := time.After(5 * time.Minute)
+
+	for {
+		select {
+		case <-server.ctx.Done():
+			// Server was stopped, exit gracefully
+			return
+		case <-timeout:
+			// Timeout reached
+			m.mu.Lock()
+			// Check if server still exists (wasn't stopped)
+			if _, exists := m.servers[modelID]; exists {
+				server.Status = "failed"
+				m.mu.Unlock()
+				log.Printf("VLLM server for model %s failed to start", modelID)
+			} else {
+				m.mu.Unlock()
+			}
+			return
+		case <-ticker.C:
+			resp, err := http.Get(endpoint)
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					m.mu.Lock()
+					server.Status = "running"
+					m.mu.Unlock()
+
+					// Signal ready
+					select {
+					case server.ReadyChan <- true:
+					default:
+					}
+
+					log.Printf("VLLM server for model %s confirmed ready via health check", modelID)
+					return
+				}
+			}
+		}
+	}
 }
 
 func (m *VLLMManager) findChatTemplate() string {
