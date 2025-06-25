@@ -1,42 +1,95 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
 	"github.com/spf13/cobra"
 	"mindlet/src"
 )
 
 func newStartCommand() *cobra.Command {
-	cfg := src.DefaultMindletConfig()
-	var modelTypeStr string
+	var (
+		port                 int
+		useVLLM              bool
+		tensorParallelSize   int
+		vllmHost             string
+		vllmPort             int
+		convertedModelsDir   string
+		dcpModelsDir         string
+		conversionScriptPath string
+		pythonPath           string
+		defaultTokenizerPath string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start inference and model servers",
+		Short: "Start the mindlet inference server",
+		Long: `Start the mindlet server that manages model loading and inference.
+Models are loaded automatically on-demand when inference requests are received.
+DCP checkpoints are converted to safetensors format automatically when needed.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg.ModelType = src.ModelType(modelTypeStr)
-			switch cfg.ModelType {
-			case src.Model8B, src.Model70B, src.Model405B:
-				break
-			default:
-				return fmt.Errorf("invalid model type: %s", modelTypeStr)
+			cfg := &src.MindletConfig{
+				Port:                 port,
+				UseVLLM:              useVLLM,
+				TensorParallelSize:   tensorParallelSize,
+				VLLMHost:             vllmHost,
+				VLLMPort:             vllmPort,
+				ConvertedModelsDir:   convertedModelsDir,
+				DCPModelsDir:         dcpModelsDir,
+				ConversionScriptPath: conversionScriptPath,
+				PythonPath:           pythonPath,
+				DefaultTokenizerPath: defaultTokenizerPath,
 			}
-			return nil
+
+			server, err := src.NewMindletServer(cfg)
+			if err != nil {
+				return fmt.Errorf("failed to create server: %w", err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			// Handle shutdown gracefully
+			sigChan := make(chan os.Signal, 1)
+			signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+			go func() {
+				<-sigChan
+				log.Println("Shutdown signal received")
+				cancel()
+			}()
+
+			log.Printf("Starting mindlet server on port %d", port)
+			if useVLLM {
+				log.Printf("VLLM enabled with tensor parallel size %d", tensorParallelSize)
+			}
+
+			return server.Start(ctx)
 		},
 	}
 
-	cmd.Flags().IntVar(&cfg.MaxSeqLength, "max-seq-length", cfg.MaxSeqLength, "Maximum sequence length")
-	cmd.Flags().IntVar(&cfg.NumCheckpointsAhead, "num-checkpoints-ahead", cfg.NumCheckpointsAhead, "Number of checkpoints ahead")
-	cmd.Flags().BoolVar(&cfg.StreamLogs, "stream-logs", cfg.StreamLogs, "Stream logs from servers")
-	cmd.Flags().StringVar(&cfg.ProjectRoot, "project-root", cfg.ProjectRoot, "Project root directory")
-	cmd.Flags().StringVar(&cfg.RamFsRoot, "ramfs-root", cfg.RamFsRoot, "RamFS root directory")
-	cmd.Flags().StringVar(&cfg.BootDir, "boot-dir", cfg.BootDir, "Boot directory")
-	cmd.Flags().StringVar(&cfg.OutputDir, "output-dir", cfg.OutputDir, "Output directory")
-	cmd.Flags().StringVar(&cfg.ModelPath, "model-path", cfg.ModelPath, "Model path")
-	cmd.Flags().StringVar(&cfg.TrainingDir, "training-dir", cfg.TrainingDir, "Training directory")
-	cmd.Flags().StringVar(&cfg.ModelManagerDir, "model-manager-dir", cfg.ModelManagerDir, "Model manager directory")
-	cmd.Flags().StringVar(&cfg.LogDir, "log-dir", cfg.LogDir, "Log directory")
-	cmd.Flags().StringVar(&modelTypeStr, "model-type", "8b", "Model type (8b, 70b, or 405b)")
+	// Server configuration
+	cmd.Flags().IntVar(&port, "port", 9090, "Mindlet server port")
+
+	// VLLM configuration
+	cmd.Flags().BoolVar(&useVLLM, "use-vllm", true, "Use VLLM for inference (recommended)")
+	cmd.Flags().IntVar(&tensorParallelSize, "tensor-parallel-size", 8, "Tensor parallel size for VLLM")
+	cmd.Flags().StringVar(&vllmHost, "host", "0.0.0.0", "VLLM server host")
+	cmd.Flags().IntVar(&vllmPort, "vllm-port", 8000, "Base port for VLLM servers")
+
+	// Model configuration
+	cmd.Flags().StringVar(&convertedModelsDir, "converted-models-dir", "/opt/dlami/nvme/converted_models", "Directory for converted models")
+	cmd.Flags().StringVar(&dcpModelsDir, "dcp-models-dir", "/mnt/cold-storage/contents/dcp", "Directory containing DCP checkpoints")
+
+	// Conversion configuration
+	cmd.Flags().StringVar(&conversionScriptPath, "conversion-script", "/home/ec2-user/workspace/torchchat/dcp_to_safetensors.py", "Path to dcp_to_safetensors.py script")
+	cmd.Flags().StringVar(&pythonPath, "python-path", "python3", "Path to Python executable")
+	cmd.Flags().StringVar(&defaultTokenizerPath, "tokenizer-path", "/mnt/cold-storage/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model", "Default tokenizer path")
 
 	return cmd
 }

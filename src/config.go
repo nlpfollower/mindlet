@@ -1,65 +1,59 @@
+// mindlet/src/config.go
 package src
 
-import "time"
-
-type ModelType string
-
-const (
-	Model8B   ModelType = "8b"
-	Model70B  ModelType = "70b"
-	Model405B ModelType = "405b"
-)
-
 type MindletConfig struct {
-	Port                int
-	MaxSeqLength        int
-	StreamLogs          bool
-	ModelType           ModelType
-	SystemPrompt        string
-	NumCheckpointsAhead int
-	BatchSize           int
-	ModelTTL            time.Duration
-	ModelCleanupTick    time.Duration
-	ModelCacheTick      time.Duration
+	// Server configuration
+	Port int
 
-	// Root directories
-	ProjectRoot string
-	RamFsRoot   string
+	// VLLM configuration
+	UseVLLM            bool
+	TensorParallelSize int
+	VLLMHost           string
+	VLLMPort           int     // Base port for VLLM servers (incremented per model)
+	GPUMemoryUtil      float64 // GPU memory utilization (0-1)
+	MaxModelLen        int     // Maximum model context length
 
-	// ProjectRoot Subdirectories
-	BootDir   string
-	OutputDir string
-	ModelPath string
+	// Model paths
+	ConvertedModelsDir string // Where to store converted safetensors models
+	DCPModelsDir       string // Where to find DCP checkpoints
 
-	// ProjectRoot/BootDir Subdirectories
-	TrainingDir     string
-	ModelManagerDir string
-	PythonPath      string
-
-	// ProjectRoot/Output Subdirectories
-	LogDir string
+	// Conversion script configuration
+	ConversionScriptPath string // Path to dcp_to_safetensors.py
+	PythonPath           string // Path to python executable
+	DefaultTokenizerPath string // Default tokenizer path
 }
 
 func DefaultMindletConfig() *MindletConfig {
 	return &MindletConfig{
-		Port:                8001,
-		MaxSeqLength:        2048,
-		StreamLogs:          false,
-		ModelType:           Model8B,
-		SystemPrompt:        "You are a helpful AI assistant",
-		NumCheckpointsAhead: 4,
-		BatchSize:           8,
-		ModelTTL:            30 * time.Minute,
-		ModelCleanupTick:    time.Minute,
-		ModelCacheTick:      50 * time.Millisecond,
-		ProjectRoot:         "/mnt/hot_storage",
-		RamFsRoot:           "/mnt/hotter_storage",
-		BootDir:             "/boot",
-		OutputDir:           "/output",
-		ModelPath:           "/model",
-		TrainingDir:         "/training",
-		ModelManagerDir:     "/model_manager",
-		PythonPath:          "/home/nlpfollower/anaconda3/envs/llama-3/bin/python",
-		LogDir:              "/mindlet_logs",
+		Port:                 9090,
+		UseVLLM:              true,
+		TensorParallelSize:   8,
+		VLLMHost:             "0.0.0.0",
+		VLLMPort:             8000,
+		GPUMemoryUtil:        0, // 0 means use VLLM default
+		MaxModelLen:          0, // 0 means use VLLM default
+		ConvertedModelsDir:   "/opt/dlami/nvme/converted_models",
+		DCPModelsDir:         "/mnt/cold-storage/contents/dcp",
+		ConversionScriptPath: "/home/ec2-user/workspace/torchchat/dcp_to_safetensors.py",
+		PythonPath:           "python3",
+		DefaultTokenizerPath: "/mnt/cold-storage/contents/checkpoints/Llama3.1-8B-Instruct",
+	}
+}
+
+// LocalTestConfig returns config for local testing
+func LocalTestConfig() *MindletConfig {
+	return &MindletConfig{
+		Port:                 19090,
+		UseVLLM:              true,
+		TensorParallelSize:   1,
+		VLLMHost:             "0.0.0.0",
+		VLLMPort:             18000,
+		GPUMemoryUtil:        0.8,
+		MaxModelLen:          16000,
+		ConvertedModelsDir:   "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/converted_models",
+		DCPModelsDir:         "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs",
+		ConversionScriptPath: "/home/nlpfollower/Desktop/deltamind/torchchat/dcp_to_safetensors.py",
+		PythonPath:           "/home/nlpfollower/anaconda3/envs/llama-3/bin/python",
+		DefaultTokenizerPath: "/home/nlpfollower/Desktop/deltamind/torchtitan/models/Llama3.1-8B-Instruct",
 	}
 }
