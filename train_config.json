@@ -1,0 +1,36 @@
+{
+  "model_path": "/mnt/cold/contents/dcp/llama-8b/step-0",
+  "dataset_path": "/mnt/cold/contents/datasets/test",
+  "tokenizer_path": "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
+  "tensor_preload": {
+    "enabled": true,
+    "threads": 60,
+    "redis_host": "localhost",
+    "redis_port": 6379,
+    "run_id": "train-test-2"
+  },
+  "torchtitan_config": {
+    "config_path": "/home/ec2-user/workspace/mindlet/torchtitan_config.toml",
+    "override_params": [
+      "--job.dump_folder=/mnt/cold/contents/outputs",
+      "--model.tokenizer_path=${TOKENIZER_PATH}",
+      "--training.dataset_path=${DATASET_PATH}",
+      "--training.dataset_type=custom",
+      "--training.dataset=file",
+      "--training.dataset_mode=sft",
+      "--training.seq_len=8192",
+      "--training.batch_size=2",
+      "--training.dataset_packing",
+      "--checkpoint.use_tensor_preload",
+      "--checkpoint.preload_run_id=${RUN_ID}"
+    ]
+  },
+  "node_topology": {
+    "head": "localhost",
+    "workers": []
+  },
+  "output_dir": "/mnt/cold/contents/outputs",
+  "rank": 0,
+  "world_size": 1,
+  "node_ip": "localhost"
+}
