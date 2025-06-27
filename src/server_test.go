@@ -362,47 +362,46 @@ func testStreamingInference(t *testing.T, serverURL string) {
 
 	t.Logf("Testing streaming with model: %s", model1Name)
 
-	// Collect streamed chunks
-	chunks := make([]map[string]interface{}, 0)
-	err := makeStreamingRequest(t, serverURL, model1Name, modelPath, "8B", messages, func(chunk map[string]interface{}) {
-		chunks = append(chunks, chunk)
-		// Log chunk for debugging
-		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
-			if choice, ok := choices[0].(map[string]interface{}); ok {
-				if delta, ok := choice["delta"].(map[string]interface{}); ok {
-					if content, ok := delta["content"].(string); ok && content != "" {
-						t.Logf("Streamed content: %q", content)
+	// Send multiple requests to test server stability
+	for i := 0; i < 3; i++ {
+		t.Logf("Request %d of 3", i+1)
+
+		// Collect streamed chunks
+		chunks := make([]map[string]interface{}, 0)
+		err := makeStreamingRequest(t, serverURL, model1Name, modelPath, "8B", messages, func(chunk map[string]interface{}) {
+			chunks = append(chunks, chunk)
+			// Log only first few chunks for each request
+			if len(chunks) <= 3 {
+				if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if delta, ok := choice["delta"].(map[string]interface{}); ok {
+							if content, ok := delta["content"].(string); ok && content != "" {
+								t.Logf("Request %d - Streamed content: %q", i+1, content)
+							}
+						}
 					}
 				}
 			}
+		})
+
+		if err != nil {
+			t.Fatalf("Streaming request %d failed: %v", i+1, err)
 		}
-	})
 
-	if err != nil {
-		t.Fatalf("Streaming request failed: %v", err)
-	}
+		// Verify we got multiple chunks
+		if len(chunks) < 2 {
+			t.Errorf("Request %d: Expected multiple chunks in stream, got: %d", i+1, len(chunks))
+		}
 
-	// Verify we got multiple chunks
-	if len(chunks) < 2 {
-		t.Errorf("Expected multiple chunks in stream, got: %d", len(chunks))
-	}
+		t.Logf("Request %d completed with %d chunks", i+1, len(chunks))
 
-	// Reconstruct full response
-	var fullContent strings.Builder
-	for _, chunk := range chunks {
-		if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
-			if choice, ok := choices[0].(map[string]interface{}); ok {
-				if delta, ok := choice["delta"].(map[string]interface{}); ok {
-					if content, ok := delta["content"].(string); ok {
-						fullContent.WriteString(content)
-					}
-				}
-			}
+		// Small delay between requests
+		if i < 2 {
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 
-	t.Logf("Full streamed response: %s", fullContent.String())
-	t.Log("Streaming inference test passed")
+	t.Log("Streaming inference test with multiple requests passed")
 }
 
 func testStreamingWithModelSwitch(t *testing.T, serverURL string) {
