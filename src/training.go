@@ -344,7 +344,7 @@ cd %s
 # Run torchrun with the config and overrides
 # Use the full path to torchrun from the same environment as Python
 %s \
-    --nproc_per_node=1 \
+    --nproc_per_node=8 \
     --nnodes="%d" \
     --node_rank="%d" \
     --master_addr="%s" \
