@@ -18,6 +18,7 @@ type TrainingConfig struct {
 	ModelPath     string              `json:"model_path"`
 	DatasetPath   string              `json:"dataset_path"`
 	TokenizerPath string              `json:"tokenizer_path"`
+	ModelName     string              `json:"model_name"`
 	TensorPreload TensorPreloadCfg    `json:"tensor_preload"`
 	TorchTitanCfg TorchTitanConfigCfg `json:"torchtitan_config"`
 	NodeTopology  NodeTopologyCfg     `json:"node_topology"`
@@ -25,7 +26,15 @@ type TrainingConfig struct {
 	Rank          int                 `json:"rank"`
 	WorldSize     int                 `json:"world_size"`
 	NodeIP        string              `json:"node_ip"`
-	ModelName     string              `json:"model_name"` // Added for checkpoint naming
+}
+
+type TrainingStatus struct {
+	Status    string    `json:"status"` // "running", "completed", "error"
+	StartTime time.Time `json:"start_time"`
+	EndTime   time.Time `json:"end_time,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	RunID     string    `json:"run_id"`
+	Rank      int       `json:"rank"`
 }
 
 // New struct to handle TorchTitan config
@@ -135,6 +144,9 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	}
 	if config.TokenizerPath == "" {
 		return nil, fmt.Errorf("tokenizer_path is required")
+	}
+	if config.ModelName == "" {
+		return nil, fmt.Errorf("model_name is required")
 	}
 	if config.NodeIP == "" {
 		return nil, fmt.Errorf("node_ip is required")
@@ -357,6 +369,11 @@ func (t *TrainingManager) moveCheckpointToDCP(trainingCfg *TrainingConfig) error
 
 // StartTraining starts the training process
 func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *TrainingConfig) error {
+	// Write initial status
+	if err := writeTrainingStatus("running", trainingCfg.TensorPreload.RunID, trainingCfg.Rank, ""); err != nil {
+		t.logger.Warn("Training", "Failed to write initial status: %v", err)
+	}
+
 	// Find the training script - use a direct path
 	scriptPath := t.scriptPath
 
@@ -468,12 +485,25 @@ cd %s
 		case err := <-done:
 			if err != nil {
 				t.logger.Error("Training", "Training script exited with error: %v", err)
+				// Write error status
+				if statusErr := writeTrainingStatus("error", trainingCfg.TensorPreload.RunID, trainingCfg.Rank, err.Error()); statusErr != nil {
+					t.logger.Warn("Training", "Failed to write error status: %v", statusErr)
+				}
 			} else {
 				t.logger.Info("Training", "Training script completed successfully")
 
 				// Move checkpoint after successful completion
 				if moveErr := t.moveCheckpointToDCP(trainingCfg); moveErr != nil {
 					t.logger.Error("Training", "Failed to move checkpoint: %v", moveErr)
+					// Write error status for checkpoint move failure
+					if statusErr := writeTrainingStatus("error", trainingCfg.TensorPreload.RunID, trainingCfg.Rank, fmt.Sprintf("checkpoint move failed: %v", moveErr)); statusErr != nil {
+						t.logger.Warn("Training", "Failed to write error status: %v", statusErr)
+					}
+				} else {
+					// Write completed status only after successful checkpoint move
+					if statusErr := writeTrainingStatus("completed", trainingCfg.TensorPreload.RunID, trainingCfg.Rank, ""); statusErr != nil {
+						t.logger.Warn("Training", "Failed to write completed status: %v", statusErr)
+					}
 				}
 			}
 
@@ -494,6 +524,10 @@ cd %s
 			t.logger.Info("Training", "Context cancelled, killing training process")
 			if cmd.Process != nil {
 				cmd.Process.Kill()
+			}
+			// Write error status for cancellation
+			if statusErr := writeTrainingStatus("error", trainingCfg.TensorPreload.RunID, trainingCfg.Rank, "training cancelled"); statusErr != nil {
+				t.logger.Warn("Training", "Failed to write cancelled status: %v", statusErr)
 			}
 
 			// Clean up the temporary files
@@ -613,4 +647,39 @@ func isRedisAvailable(host string, port int) bool {
 	cmd := exec.Command("nc", "-z", "-w", "1", host, fmt.Sprintf("%d", port))
 	err := cmd.Run()
 	return err == nil
+}
+
+// writeTrainingStatus writes the current training status to a file
+func writeTrainingStatus(status string, runID string, rank int, errorMsg string) error {
+	statusData := TrainingStatus{
+		Status:    status,
+		StartTime: time.Now(),
+		RunID:     runID,
+		Rank:      rank,
+	}
+
+	if status == "completed" || status == "error" {
+		statusData.EndTime = time.Now()
+	}
+
+	if errorMsg != "" {
+		statusData.Error = errorMsg
+	}
+
+	// Read existing status file to preserve start time if updating
+	existingFile := filepath.Join(os.Getenv("HOME"), "training_status.json")
+	if existing, err := os.ReadFile(existingFile); err == nil {
+		var existingStatus TrainingStatus
+		if json.Unmarshal(existing, &existingStatus) == nil && existingStatus.RunID == runID {
+			// Preserve original start time
+			statusData.StartTime = existingStatus.StartTime
+		}
+	}
+
+	data, err := json.MarshalIndent(statusData, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal status: %v", err)
+	}
+
+	return os.WriteFile(existingFile, data, 0644)
 }

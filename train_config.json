@@ -2,6 +2,7 @@
   "model_path": "/mnt/cold/contents/dcp/llama-8b/checkpoint/step-0",
   "dataset_path": "/mnt/cold/contents/datasets/test",
   "tokenizer_path": "/mnt/cold/contents/checkpoints/Llama3.1-8B-Instruct/tokenizer.model",
+  "model_name": "test-model",
   "tensor_preload": {
     "enabled": true,
     "threads": 60,

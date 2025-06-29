@@ -2,6 +2,7 @@
   "model_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/checkpoint/step-0",
   "dataset_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/outputs/datasets/test",
   "tokenizer_path": "/home/nlpfollower/Desktop/deltamind/torchtitan/models/Llama3.2-3B-Instruct/tokenizer.model",
+  "model_name": "test-model",
   "tensor_preload": {
     "enabled": true,
     "threads": 60,
