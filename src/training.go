@@ -25,6 +25,7 @@ type TrainingConfig struct {
 	Rank          int                 `json:"rank"`
 	WorldSize     int                 `json:"world_size"`
 	NodeIP        string              `json:"node_ip"`
+	ModelName     string              `json:"model_name"` // Added for checkpoint naming
 }
 
 // New struct to handle TorchTitan config
@@ -300,6 +301,60 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 	return nil
 }
 
+// moveCheckpointToDCP moves the final checkpoint to the DCP directory
+func (t *TrainingManager) moveCheckpointToDCP(trainingCfg *TrainingConfig) error {
+	if trainingCfg.ModelName == "" {
+		t.logger.Warn("Training", "No model name provided, skipping checkpoint move")
+		return nil
+	}
+
+	// Only perform on head node (rank 0)
+	if trainingCfg.Rank != 0 {
+		t.logger.Info("Training", "Skipping checkpoint move on worker node (rank %d)", trainingCfg.Rank)
+		return nil
+	}
+
+	// Extract base DCP directory from model path
+	// Model path looks like: /mnt/cold/contents/dcp/llama-8b/checkpoint/step-0
+	// We need to go up 3 levels to get to /mnt/cold/contents/dcp
+	modelDir := filepath.Dir(trainingCfg.ModelPath) // removes step-0
+	modelDir = filepath.Dir(modelDir)               // removes checkpoint
+	dcpBaseDir := filepath.Dir(modelDir)            // removes model name, gives us /mnt/cold/contents/dcp
+
+	// Define source and destination paths
+	sourcePath := filepath.Join(trainingCfg.OutputDir, "checkpoint", "step-final")
+	destBaseDir := filepath.Join(dcpBaseDir, trainingCfg.ModelName, "checkpoint")
+	destPath := filepath.Join(destBaseDir, "step-0")
+
+	t.logger.Info("Training", "Moving checkpoint from %s to %s", sourcePath, destPath)
+
+	// Check if source exists
+	if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
+		return fmt.Errorf("source checkpoint not found: %s", sourcePath)
+	}
+
+	// Create destination directory if it doesn't exist
+	if err := os.MkdirAll(destBaseDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %v", err)
+	}
+
+	// Check if destination already exists and remove it
+	if _, err := os.Stat(destPath); err == nil {
+		t.logger.Info("Training", "Removing existing checkpoint at: %s", destPath)
+		if err := os.RemoveAll(destPath); err != nil {
+			return fmt.Errorf("failed to remove existing checkpoint: %v", err)
+		}
+	}
+
+	// Move the checkpoint directory
+	if err := os.Rename(sourcePath, destPath); err != nil {
+		return fmt.Errorf("failed to move checkpoint: %v", err)
+	}
+
+	t.logger.Info("Training", "Successfully moved checkpoint to %s", destPath)
+	return nil
+}
+
 // StartTraining starts the training process
 func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *TrainingConfig) error {
 	// Find the training script - use a direct path
@@ -415,6 +470,11 @@ cd %s
 				t.logger.Error("Training", "Training script exited with error: %v", err)
 			} else {
 				t.logger.Info("Training", "Training script completed successfully")
+
+				// Move checkpoint after successful completion
+				if moveErr := t.moveCheckpointToDCP(trainingCfg); moveErr != nil {
+					t.logger.Error("Training", "Failed to move checkpoint: %v", moveErr)
+				}
 			}
 
 			// Clean up tensor preloader if it's still running

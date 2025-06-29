@@ -19,6 +19,7 @@ func newTrainCommand() *cobra.Command {
 		scriptPath      string        // Path to run_training.sh
 		modelLoaderPath string        // Path to model_loader.py
 		torchtitanPath  string        // Path to torchtitan directory
+		modelName       string        // Model name for checkpoint directory
 	)
 
 	cmd := &cobra.Command{
@@ -62,6 +63,10 @@ the training process with optional tensor preloading.`,
 				logger.Info("Training", "Using custom torchtitan path: %s", torchtitanPath)
 			}
 
+			if modelName != "" {
+				logger.Info("Training", "Model name for checkpoint: %s", modelName)
+			}
+
 			// Create training manager
 			trainingManager, err := src.NewTrainingManager(cfg, logger)
 			if err != nil {
@@ -72,6 +77,11 @@ the training process with optional tensor preloading.`,
 			trainingCfg, err := trainingManager.LoadTrainingConfig(configFile)
 			if err != nil {
 				return fmt.Errorf("failed to load training config: %v", err)
+			}
+
+			// Set model name if provided via CLI (overrides config)
+			if modelName != "" {
+				trainingCfg.ModelName = modelName
 			}
 
 			// Set up context with cancellation for cleanup
@@ -139,6 +149,7 @@ the training process with optional tensor preloading.`,
 	cmd.Flags().StringVar(&scriptPath, "script-path", "./scripts/run_training.sh", "Path to run_training.sh script")
 	cmd.Flags().StringVar(&modelLoaderPath, "model-loader-path", "../torchtitan/model_loader.py", "Path to model_loader.py script")
 	cmd.Flags().StringVar(&torchtitanPath, "torchtitan-path", "/home/nlpfollower/Desktop/deltamind/torchtitan", "Path to torchtitan directory")
+	cmd.Flags().StringVar(&modelName, "model-name", "", "Model name for checkpoint directory (e.g., llama-8b-u1-c2)")
 
 	return cmd
 }
