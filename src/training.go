@@ -236,6 +236,48 @@ func (t *TrainingManager) copyMetadataToNFS(trainingCfg *TrainingConfig) error {
 	return nil
 }
 
+// copyTokenizerToNFS copies the tokenizer file to NFS shared location
+func (t *TrainingManager) copyTokenizerToNFS(trainingCfg *TrainingConfig) error {
+	// Source tokenizer file (should include tokenizer.model)
+	sourceTokenizer := trainingCfg.TokenizerPath
+
+	// Destination tokenizer file on NFS
+	destTokenizer := filepath.Join(trainingCfg.NFSPath, "tokenizer.model")
+
+	t.logger.Info("Training", "Copying tokenizer from %s to %s", sourceTokenizer, destTokenizer)
+
+	// Check if source tokenizer exists
+	if _, err := os.Stat(sourceTokenizer); os.IsNotExist(err) {
+		return fmt.Errorf("source tokenizer file not found: %s", sourceTokenizer)
+	}
+
+	// Create destination directory if it doesn't exist
+	destDir := filepath.Dir(destTokenizer)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %v", destDir, err)
+	}
+
+	// Copy the tokenizer file
+	sourceFile, err := os.Open(sourceTokenizer)
+	if err != nil {
+		return fmt.Errorf("failed to open source tokenizer file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(destTokenizer)
+	if err != nil {
+		return fmt.Errorf("failed to create destination tokenizer file: %v", err)
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy tokenizer file: %v", err)
+	}
+
+	t.logger.Info("Training", "Successfully copied tokenizer to NFS shared location")
+	return nil
+}
+
 // StartTensorPreloader starts the tensor preloader process in a managed goroutine
 func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg *TrainingConfig) error {
 	if !trainingCfg.TensorPreload.Enabled {
@@ -262,6 +304,11 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		// Copy metadata file to NFS shared location
 		if err := t.copyMetadataToNFS(trainingCfg); err != nil {
 			return fmt.Errorf("failed to copy metadata to NFS: %w", err)
+		}
+
+		// Copy tokenizer file to NFS shared location
+		if err := t.copyTokenizerToNFS(trainingCfg); err != nil {
+			return fmt.Errorf("failed to copy tokenizer to NFS: %w", err)
 		}
 	} else {
 		// For worker nodes, wait to ensure head node has Redis up and running
@@ -479,8 +526,8 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 
 	// Prepare a temporary script to run TorchTitan with the correct parameters
 	tmpScriptPath := filepath.Join(os.TempDir(), "run_torchtitan_tmp.sh")
-	// In the orchestration mindlet.go, update the torchtitanCmd in startTraining function:
 
+	// In the orchestration mindlet.go, update the torchtitanCmd in startTraining function:
 	torchtitanCmd := fmt.Sprintf(`#!/bin/bash
 set -e
 
