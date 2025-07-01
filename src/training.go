@@ -278,6 +278,39 @@ func (t *TrainingManager) copyTokenizerToNFS(trainingCfg *TrainingConfig) error 
 	return nil
 }
 
+// copyDatasetToNFS copies the dataset directory to NFS shared location
+func (t *TrainingManager) copyDatasetToNFS(trainingCfg *TrainingConfig) error {
+	// Source dataset directory
+	sourceDataset := trainingCfg.DatasetPath
+
+	// Destination dataset directory on NFS
+	destDataset := filepath.Join(trainingCfg.NFSPath, "dataset")
+
+	t.logger.Info("Training", "Copying dataset from %s to %s", sourceDataset, destDataset)
+
+	// Check if source dataset directory exists
+	if _, err := os.Stat(sourceDataset); os.IsNotExist(err) {
+		return fmt.Errorf("source dataset directory not found: %s", sourceDataset)
+	}
+
+	// Create destination directory if it doesn't exist
+	if err := os.MkdirAll(destDataset, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %v", destDataset, err)
+	}
+
+	// Copy all files from source dataset directory to destination
+	// Using a shell command for efficient recursive copy
+	copyCmd := fmt.Sprintf("cp -r %s/* %s/", sourceDataset, destDataset)
+	cmd := exec.Command("sh", "-c", copyCmd)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to copy dataset directory: %v", err)
+	}
+
+	t.logger.Info("Training", "Successfully copied dataset to NFS shared location")
+	return nil
+}
+
 // StartTensorPreloader starts the tensor preloader process in a managed goroutine
 func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg *TrainingConfig) error {
 	if !trainingCfg.TensorPreload.Enabled {
@@ -309,6 +342,11 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		// Copy tokenizer file to NFS shared location
 		if err := t.copyTokenizerToNFS(trainingCfg); err != nil {
 			return fmt.Errorf("failed to copy tokenizer to NFS: %w", err)
+		}
+
+		// Copy dataset to NFS shared location
+		if err := t.copyDatasetToNFS(trainingCfg); err != nil {
+			return fmt.Errorf("failed to copy dataset to NFS: %w", err)
 		}
 	} else {
 		// For worker nodes, wait to ensure head node has Redis up and running
@@ -345,6 +383,23 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 			}
 			time.Sleep(1 * time.Second)
 			t.logger.Info("Training", "Waiting for metadata file... (attempt %d/%d)", i+1, maxMetadataRetries)
+		}
+
+		// Wait for dataset to be available on NFS
+		datasetPath := filepath.Join(trainingCfg.NFSPath, "dataset")
+		t.logger.Info("Training", "Worker node: waiting for dataset at %s", datasetPath)
+
+		maxDatasetRetries := 60 // 60 seconds max wait (dataset copy might take longer)
+		for i := 0; i < maxDatasetRetries; i++ {
+			if _, err := os.Stat(datasetPath); err == nil {
+				t.logger.Info("Training", "Dataset found on NFS")
+				break
+			}
+			if i == maxDatasetRetries-1 {
+				return fmt.Errorf("dataset not found on NFS after %d attempts", maxDatasetRetries)
+			}
+			time.Sleep(1 * time.Second)
+			t.logger.Info("Training", "Waiting for dataset... (attempt %d/%d)", i+1, maxDatasetRetries)
 		}
 	}
 
