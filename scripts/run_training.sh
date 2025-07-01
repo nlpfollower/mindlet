@@ -112,9 +112,6 @@ echo "Model path: $MODEL_PATH"
 echo "Dataset path: $DATASET_PATH"
 echo "Head node: $HEAD_NODE"
 
-# Create output directory
-mkdir -p "$OUTPUT_DIR"
-
 # Set up clean exit trap
 trap cleanup EXIT INT TERM
 cleanup() {
