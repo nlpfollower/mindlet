@@ -479,33 +479,49 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 
 	// Prepare a temporary script to run TorchTitan with the correct parameters
 	tmpScriptPath := filepath.Join(os.TempDir(), "run_torchtitan_tmp.sh")
+	// In the orchestration mindlet.go, update the torchtitanCmd in startTraining function:
+
 	torchtitanCmd := fmt.Sprintf(`#!/bin/bash
 set -e
 
 # Export environment variables
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export NCCL_DEBUG=WARN
+export NCCL_DEBUG=INFO
 export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
 export NCCL_IB_DISABLE=1
+
+# Use the head node IP for rendezvous endpoint
+head_node_ip="%s"
+
+# Log the torchrun parameters for debugging
+echo "=== TORCHRUN CONFIGURATION ==="
+echo "Head Node IP: $head_node_ip"
+echo "Number of Nodes: %d"
+echo "Processes per Node: 8"
+echo "Rendezvous ID: 101"
+echo "Rendezvous Backend: c10d"
+echo "Rendezvous Endpoint: $head_node_ip:29500"
+echo "Config File: %s"
+echo "Override Parameters: %s"
+echo "TorchTitan Path: %s"
+echo "================================"
 
 # Change to TorchTitan directory - use the path from configuration
 cd %s
 
-# Run torchrun with the config and overrides
-# Use the full path to torchrun from the same environment as Python
+# Run torchrun with dynamic rendezvous (matching the working approach)
 %s \
+    --nnodes=%d \
     --nproc_per_node=8 \
-    --nnodes="%d" \
-    --node_rank="%d" \
-    --master_addr="%s" \
-    --master_port=29500 \
     --rdzv_id=101 \
     --rdzv_backend=c10d \
+    --rdzv_endpoint="$head_node_ip:29500" \
     train.py \
     --job.config_file="%s" \
     %s
-`, t.torchtitanPath, torchrunPath, trainingCfg.WorldSize, trainingCfg.Rank, trainingCfg.NodeTopology.Head,
-		trainingCfg.TorchTitanCfg.ConfigPath, strings.Join(processedParams, " "))
+`, trainingCfg.NodeTopology.Head, trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath,
+		strings.Join(processedParams, " "), t.torchtitanPath, t.torchtitanPath, torchrunPath,
+		trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath, strings.Join(processedParams, " "))
 
 	if err := os.WriteFile(tmpScriptPath, []byte(torchtitanCmd), 0755); err != nil {
 		return fmt.Errorf("failed to write temporary script: %v", err)
