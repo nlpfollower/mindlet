@@ -20,6 +20,7 @@ func newTrainCommand() *cobra.Command {
 		modelLoaderPath string        // Path to model_loader.py
 		torchtitanPath  string        // Path to torchtitan directory
 		modelName       string        // Model name for checkpoint directory
+		nfsPath         string        // NFS shared path for metadata
 	)
 
 	cmd := &cobra.Command{
@@ -67,6 +68,10 @@ the training process with optional tensor preloading.`,
 				logger.Info("Training", "Model name for checkpoint: %s", modelName)
 			}
 
+			if nfsPath != "" {
+				logger.Info("Training", "Using NFS path: %s", nfsPath)
+			}
+
 			// Create training manager
 			trainingManager, err := src.NewTrainingManager(cfg, logger)
 			if err != nil {
@@ -82,6 +87,11 @@ the training process with optional tensor preloading.`,
 			// Set model name if provided via CLI (overrides config)
 			if modelName != "" {
 				trainingCfg.ModelName = modelName
+			}
+
+			// Set NFS path if provided via CLI (overrides config)
+			if nfsPath != "" {
+				trainingCfg.NFSPath = nfsPath
 			}
 
 			// Set up context with cancellation for cleanup
@@ -150,6 +160,7 @@ the training process with optional tensor preloading.`,
 	cmd.Flags().StringVar(&modelLoaderPath, "model-loader-path", "../torchtitan/model_loader.py", "Path to model_loader.py script")
 	cmd.Flags().StringVar(&torchtitanPath, "torchtitan-path", "/home/nlpfollower/Desktop/deltamind/torchtitan", "Path to torchtitan directory")
 	cmd.Flags().StringVar(&modelName, "model-name", "", "Model name for checkpoint directory (e.g., llama-8b-u1-c2)")
+	cmd.Flags().StringVar(&nfsPath, "nfs-path", "/mnt/nfs_shared", "NFS shared path for metadata sharing between nodes")
 
 	return cmd
 }

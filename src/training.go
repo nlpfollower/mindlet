@@ -23,6 +23,7 @@ type TrainingConfig struct {
 	TorchTitanCfg TorchTitanConfigCfg `json:"torchtitan_config"`
 	NodeTopology  NodeTopologyCfg     `json:"node_topology"`
 	OutputDir     string              `json:"output_dir"`
+	NFSPath       string              `json:"nfs_path"`
 	Rank          int                 `json:"rank"`
 	WorldSize     int                 `json:"world_size"`
 	NodeIP        string              `json:"node_ip"`
@@ -174,6 +175,9 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	if config.OutputDir == "" {
 		config.OutputDir = "/mnt/nfs_shared/output"
 	}
+	if config.NFSPath == "" {
+		config.NFSPath = "/mnt/nfs_shared"
+	}
 
 	// Verify TorchTitan config file exists
 	if _, err := os.Stat(config.TorchTitanCfg.ConfigPath); os.IsNotExist(err) {
@@ -188,6 +192,48 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	t.logger.Info("Training", "TorchTitan override parameters: %s", strings.Join(processedParams, " "))
 
 	return &config, nil
+}
+
+// copyMetadataToNFS copies the metadata file from model path to NFS shared location
+func (t *TrainingManager) copyMetadataToNFS(trainingCfg *TrainingConfig) error {
+	// Source metadata file
+	sourceMetadata := filepath.Join(trainingCfg.ModelPath, ".metadata")
+
+	// Destination metadata file on NFS
+	destMetadata := filepath.Join(trainingCfg.NFSPath, "model", ".metadata")
+
+	t.logger.Info("Training", "Copying metadata from %s to %s", sourceMetadata, destMetadata)
+
+	// Check if source metadata exists
+	if _, err := os.Stat(sourceMetadata); os.IsNotExist(err) {
+		return fmt.Errorf("source metadata file not found: %s", sourceMetadata)
+	}
+
+	// Create destination directory if it doesn't exist
+	destDir := filepath.Dir(destMetadata)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %v", destDir, err)
+	}
+
+	// Copy the metadata file
+	sourceFile, err := os.Open(sourceMetadata)
+	if err != nil {
+		return fmt.Errorf("failed to open source metadata file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(destMetadata)
+	if err != nil {
+		return fmt.Errorf("failed to create destination metadata file: %v", err)
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy metadata file: %v", err)
+	}
+
+	t.logger.Info("Training", "Successfully copied metadata to NFS shared location")
+	return nil
 }
 
 // StartTensorPreloader starts the tensor preloader process in a managed goroutine
@@ -205,13 +251,18 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 	}
 	t.runID = runID
 
-	// If this is the head node, ensure Redis is running and ready
+	// If this is the head node, ensure Redis is running and copy metadata to NFS
 	if trainingCfg.Rank == 0 {
 		// Start Redis first
 		if err := ensureRedisRunning(t.logger, trainingCfg.TensorPreload.RedisPort); err != nil {
 			return fmt.Errorf("failed to ensure Redis is running: %w", err)
 		}
 		t.logger.Info("Training", "Redis server is ready on port %d", trainingCfg.TensorPreload.RedisPort)
+
+		// Copy metadata file to NFS shared location
+		if err := t.copyMetadataToNFS(trainingCfg); err != nil {
+			return fmt.Errorf("failed to copy metadata to NFS: %w", err)
+		}
 	} else {
 		// For worker nodes, wait to ensure head node has Redis up and running
 		t.logger.Info("Training", "Worker node: waiting for Redis to be available on %s:%d",
@@ -231,6 +282,23 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 			time.Sleep(1 * time.Second)
 			t.logger.Info("Training", "Waiting for Redis server... (attempt %d/%d)", i+1, maxRetries)
 		}
+
+		// Wait for metadata file to be available on NFS
+		metadataPath := filepath.Join(trainingCfg.NFSPath, "model", ".metadata")
+		t.logger.Info("Training", "Worker node: waiting for metadata file at %s", metadataPath)
+
+		maxMetadataRetries := 30 // 30 seconds max wait
+		for i := 0; i < maxMetadataRetries; i++ {
+			if _, err := os.Stat(metadataPath); err == nil {
+				t.logger.Info("Training", "Metadata file found on NFS")
+				break
+			}
+			if i == maxMetadataRetries-1 {
+				return fmt.Errorf("metadata file not found on NFS after %d attempts", maxMetadataRetries)
+			}
+			time.Sleep(1 * time.Second)
+			t.logger.Info("Training", "Waiting for metadata file... (attempt %d/%d)", i+1, maxMetadataRetries)
+		}
 	}
 
 	// Use a specific path for model_loader.py
@@ -245,8 +313,9 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 
 	// Construct the preloader command
 	preloaderMutex.Lock()
-	preloaderCmd = exec.Command(
-		t.config.PythonPath,
+
+	// Build command arguments
+	args := []string{
 		modelLoaderPath,
 		trainingCfg.ModelPath,
 		"--threads", fmt.Sprintf("%d", trainingCfg.TensorPreload.Threads),
@@ -255,7 +324,16 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		"--redis-host", trainingCfg.TensorPreload.RedisHost,
 		"--redis-port", fmt.Sprintf("%d", trainingCfg.TensorPreload.RedisPort),
 		"--run-id", runID,
-	)
+	}
+
+	// Add metadata-path for worker nodes only
+	if trainingCfg.Rank > 0 {
+		metadataPath := filepath.Join(trainingCfg.NFSPath, "model", ".metadata")
+		args = append(args, "--metadata-path", metadataPath)
+		t.logger.Info("Training", "Worker node using NFS metadata path: %s", metadataPath)
+	}
+
+	preloaderCmd = exec.Command(t.config.PythonPath, args...)
 	preloaderMutex.Unlock()
 
 	// Connect stdout and stderr for logging
