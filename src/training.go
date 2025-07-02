@@ -623,6 +623,13 @@ func (t *TrainingManager) StartTraining(ctx context.Context, trainingCfg *Traini
 	// Prepare a temporary script to run TorchTitan with the correct parameters
 	tmpScriptPath := filepath.Join(os.TempDir(), "run_torchtitan_tmp.sh")
 
+	// Build the checkpoint flag for head node
+	checkpointFlag := ""
+	if trainingCfg.Rank == 0 {
+		checkpointFlag = "--checkpoint.is_infra_node0"
+		t.logger.Info("Training", "Head node: adding --checkpoint.is_infra_node0 flag to torchtitan command")
+	}
+
 	// In the orchestration mindlet.go, update the torchtitanCmd in startTraining function:
 	torchtitanCmd := fmt.Sprintf(`#!/bin/bash
 set -e
@@ -661,10 +668,12 @@ cd %s
     --rdzv_endpoint="$head_node_ip:29500" \
     train.py \
     --job.config_file="%s" \
+    %s \
     %s
 `, trainingCfg.NodeTopology.Head, trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath,
 		strings.Join(processedParams, " "), t.torchtitanPath, t.torchtitanPath, torchrunPath,
-		trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath, strings.Join(processedParams, " "))
+		trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath, strings.Join(processedParams, " "),
+		checkpointFlag)
 
 	if err := os.WriteFile(tmpScriptPath, []byte(torchtitanCmd), 0755); err != nil {
 		return fmt.Errorf("failed to write temporary script: %v", err)
