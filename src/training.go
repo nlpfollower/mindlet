@@ -304,8 +304,31 @@ func (t *TrainingManager) copyDatasetToNFS(trainingCfg *TrainingConfig) error {
 
 // copyMetadataToCheckpoint copies the metadata file to the checkpoint directory
 func (t *TrainingManager) copyMetadataToCheckpoint(trainingCfg *TrainingConfig) error {
-	// Source metadata file - always use modelPath/.metadata
-	sourceMetadata := filepath.Join(trainingCfg.ModelPath, ".metadata")
+	var sourceMetadata string
+
+	if trainingCfg.Rank == 0 {
+		// Head node: use original model path
+		sourceMetadata = filepath.Join(trainingCfg.ModelPath, ".metadata")
+	} else {
+		// Worker nodes: use NFS path
+		sourceMetadata = filepath.Join(trainingCfg.NFSPath, "model", ".metadata")
+
+		// Wait for the metadata file to be available on NFS
+		t.logger.Info("Training", "Worker node: waiting for metadata file at %s", sourceMetadata)
+
+		maxRetries := 60 // 60 seconds max wait
+		for i := 0; i < maxRetries; i++ {
+			if _, err := os.Stat(sourceMetadata); err == nil {
+				t.logger.Info("Training", "Metadata file found on NFS")
+				break
+			}
+			if i == maxRetries-1 {
+				return fmt.Errorf("metadata file not found on NFS after %d attempts", maxRetries)
+			}
+			time.Sleep(1 * time.Second)
+			t.logger.Info("Training", "Waiting for metadata file... (attempt %d/%d)", i+1, maxRetries)
+		}
+	}
 
 	var destMetadata string
 	if trainingCfg.Rank == 0 {
@@ -329,6 +352,36 @@ func (t *TrainingManager) copyMetadataToCheckpoint(trainingCfg *TrainingConfig) 
 	}
 
 	t.logger.Info("Training", "Successfully copied metadata to checkpoint directory")
+	return nil
+}
+
+// restoreOriginalMetadata copies the original metadata back to the output checkpoint
+func (t *TrainingManager) restoreOriginalMetadata(trainingCfg *TrainingConfig) error {
+	// Only perform on head node (rank 0)
+	if trainingCfg.Rank != 0 {
+		t.logger.Info("Training", "Skipping metadata restore on worker node (rank %d)", trainingCfg.Rank)
+		return nil
+	}
+
+	// Source: original model path metadata
+	sourceMetadata := filepath.Join(trainingCfg.ModelPath, ".metadata")
+
+	// Destination: output checkpoint step-0
+	destMetadata := filepath.Join(trainingCfg.OutputDir, "checkpoint", "step-0", ".metadata")
+
+	t.logger.Info("Training", "Restoring original metadata from %s to %s", sourceMetadata, destMetadata)
+
+	// Check if source metadata exists
+	if _, err := os.Stat(sourceMetadata); os.IsNotExist(err) {
+		return fmt.Errorf("original metadata file not found: %s", sourceMetadata)
+	}
+
+	// Copy the metadata file, overwriting any existing one
+	if err := copyFile(sourceMetadata, destMetadata); err != nil {
+		return fmt.Errorf("failed to restore original metadata: %v", err)
+	}
+
+	t.logger.Info("Training", "Successfully restored original metadata to output checkpoint")
 	return nil
 }
 
@@ -393,23 +446,6 @@ func (t *TrainingManager) SetupTrainingFiles(ctx context.Context, trainingCfg *T
 			}
 		}
 
-		// Wait for metadata file to be available on NFS
-		metadataPath := filepath.Join(trainingCfg.NFSPath, "model", ".metadata")
-		t.logger.Info("Training", "Worker node: waiting for metadata file at %s", metadataPath)
-
-		maxMetadataRetries := 30 // 30 seconds max wait
-		for i := 0; i < maxMetadataRetries; i++ {
-			if _, err := os.Stat(metadataPath); err == nil {
-				t.logger.Info("Training", "Metadata file found on NFS")
-				break
-			}
-			if i == maxMetadataRetries-1 {
-				return fmt.Errorf("metadata file not found on NFS after %d attempts", maxMetadataRetries)
-			}
-			time.Sleep(1 * time.Second)
-			t.logger.Info("Training", "Waiting for metadata file... (attempt %d/%d)", i+1, maxMetadataRetries)
-		}
-
 		// Wait for dataset to be available on NFS
 		datasetPath := filepath.Join(trainingCfg.NFSPath, "dataset")
 		t.logger.Info("Training", "Worker node: waiting for dataset at %s", datasetPath)
@@ -428,6 +464,7 @@ func (t *TrainingManager) SetupTrainingFiles(ctx context.Context, trainingCfg *T
 		}
 
 		// Copy metadata to checkpoint directory for worker node
+		// This will wait for the NFS metadata file internally
 		if err := t.copyMetadataToCheckpoint(trainingCfg); err != nil {
 			t.logger.Warn("Training", "Failed to copy metadata to checkpoint directory: %v", err)
 			// Don't fail the entire setup for this
@@ -737,6 +774,12 @@ cd %s
 				}
 			} else {
 				t.logger.Info("Training", "Training script completed successfully")
+
+				// Restore original metadata on head node
+				if restoreErr := t.restoreOriginalMetadata(trainingCfg); restoreErr != nil {
+					t.logger.Error("Training", "Failed to restore original metadata: %v", restoreErr)
+					// Don't fail the entire training for this
+				}
 
 				// Move checkpoint after successful completion
 				if moveErr := t.moveCheckpointToDCP(trainingCfg); moveErr != nil {
