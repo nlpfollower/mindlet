@@ -700,17 +700,18 @@ cd %s
 %s \
     --nnodes=%d \
     --nproc_per_node=8 \
-    --rdzv_id=101 \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint="$head_node_ip:29500" \
+    --local-ranks-filter 0 \
+    --master_addr="$head_node_ip" \
+    --master_port=29500 \
+    --node_rank %d \
     train.py \
     --job.config_file="%s" \
     %s \
     %s
 `, trainingCfg.NodeTopology.Head, trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath,
 		strings.Join(processedParams, " "), t.torchtitanPath, t.torchtitanPath, torchrunPath,
-		trainingCfg.WorldSize, trainingCfg.TorchTitanCfg.ConfigPath, strings.Join(processedParams, " "),
-		checkpointFlag)
+		trainingCfg.WorldSize, trainingCfg.Rank, trainingCfg.TorchTitanCfg.ConfigPath,
+		strings.Join(processedParams, " "), checkpointFlag)
 
 	if err := os.WriteFile(tmpScriptPath, []byte(torchtitanCmd), 0755); err != nil {
 		return fmt.Errorf("failed to write temporary script: %v", err)
