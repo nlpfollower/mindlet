@@ -366,14 +366,20 @@ func (t *TrainingManager) restoreOriginalMetadata(trainingCfg *TrainingConfig) e
 	// Source: original model path metadata
 	sourceMetadata := filepath.Join(trainingCfg.ModelPath, ".metadata")
 
-	// Destination: output checkpoint step-0
-	destMetadata := filepath.Join(trainingCfg.OutputDir, "checkpoint", "step-0", ".metadata")
+	// Destination: output checkpoint step-final (this is what gets moved to DCP)
+	destMetadata := filepath.Join(trainingCfg.OutputDir, "checkpoint", "step-final", ".metadata")
 
 	t.logger.Info("Training", "Restoring original metadata from %s to %s", sourceMetadata, destMetadata)
 
 	// Check if source metadata exists
 	if _, err := os.Stat(sourceMetadata); os.IsNotExist(err) {
 		return fmt.Errorf("original metadata file not found: %s", sourceMetadata)
+	}
+
+	// Check if step-final directory exists
+	stepFinalDir := filepath.Join(trainingCfg.OutputDir, "checkpoint", "step-final")
+	if _, err := os.Stat(stepFinalDir); os.IsNotExist(err) {
+		return fmt.Errorf("step-final checkpoint directory not found: %s", stepFinalDir)
 	}
 
 	// Copy the metadata file, overwriting any existing one
