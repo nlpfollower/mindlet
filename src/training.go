@@ -194,6 +194,33 @@ func (t *TrainingManager) LoadTrainingConfig(path string) (*TrainingConfig, erro
 	return &config, nil
 }
 
+// copyFile is a helper function to copy a single file
+func copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("failed to open source file: %v", err)
+	}
+	defer sourceFile.Close()
+
+	// Create destination directory if it doesn't exist
+	destDir := filepath.Dir(dst)
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %v", destDir, err)
+	}
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("failed to create destination file: %v", err)
+	}
+	defer destFile.Close()
+
+	if _, err := io.Copy(destFile, sourceFile); err != nil {
+		return fmt.Errorf("failed to copy file: %v", err)
+	}
+
+	return nil
+}
+
 // copyMetadataToNFS copies the metadata file from model path to NFS shared location
 func (t *TrainingManager) copyMetadataToNFS(trainingCfg *TrainingConfig) error {
 	// Source metadata file
@@ -209,27 +236,9 @@ func (t *TrainingManager) copyMetadataToNFS(trainingCfg *TrainingConfig) error {
 		return fmt.Errorf("source metadata file not found: %s", sourceMetadata)
 	}
 
-	// Create destination directory if it doesn't exist
-	destDir := filepath.Dir(destMetadata)
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return fmt.Errorf("failed to create destination directory %s: %v", destDir, err)
-	}
-
 	// Copy the metadata file
-	sourceFile, err := os.Open(sourceMetadata)
-	if err != nil {
-		return fmt.Errorf("failed to open source metadata file: %v", err)
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(destMetadata)
-	if err != nil {
-		return fmt.Errorf("failed to create destination metadata file: %v", err)
-	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, sourceFile); err != nil {
-		return fmt.Errorf("failed to copy metadata file: %v", err)
+	if err := copyFile(sourceMetadata, destMetadata); err != nil {
+		return fmt.Errorf("failed to copy metadata to NFS: %v", err)
 	}
 
 	t.logger.Info("Training", "Successfully copied metadata to NFS shared location")
@@ -251,27 +260,9 @@ func (t *TrainingManager) copyTokenizerToNFS(trainingCfg *TrainingConfig) error 
 		return fmt.Errorf("source tokenizer file not found: %s", sourceTokenizer)
 	}
 
-	// Create destination directory if it doesn't exist
-	destDir := filepath.Dir(destTokenizer)
-	if err := os.MkdirAll(destDir, 0755); err != nil {
-		return fmt.Errorf("failed to create destination directory %s: %v", destDir, err)
-	}
-
 	// Copy the tokenizer file
-	sourceFile, err := os.Open(sourceTokenizer)
-	if err != nil {
-		return fmt.Errorf("failed to open source tokenizer file: %v", err)
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(destTokenizer)
-	if err != nil {
-		return fmt.Errorf("failed to create destination tokenizer file: %v", err)
-	}
-	defer destFile.Close()
-
-	if _, err := io.Copy(destFile, sourceFile); err != nil {
-		return fmt.Errorf("failed to copy tokenizer file: %v", err)
+	if err := copyFile(sourceTokenizer, destTokenizer); err != nil {
+		return fmt.Errorf("failed to copy tokenizer to NFS: %v", err)
 	}
 
 	t.logger.Info("Training", "Successfully copied tokenizer to NFS shared location")
@@ -311,13 +302,38 @@ func (t *TrainingManager) copyDatasetToNFS(trainingCfg *TrainingConfig) error {
 	return nil
 }
 
-// StartTensorPreloader starts the tensor preloader process in a managed goroutine
-func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg *TrainingConfig) error {
-	if !trainingCfg.TensorPreload.Enabled {
-		t.logger.Info("Training", "Tensor preloading is disabled")
-		return nil
+// copyMetadataToCheckpoint copies the metadata file to the checkpoint directory
+func (t *TrainingManager) copyMetadataToCheckpoint(trainingCfg *TrainingConfig) error {
+	// Source metadata file - always use modelPath/.metadata
+	sourceMetadata := filepath.Join(trainingCfg.ModelPath, ".metadata")
+
+	var destMetadata string
+	if trainingCfg.Rank == 0 {
+		// Head node: copy to outputDir/checkpoint/step-0
+		destMetadata = filepath.Join(trainingCfg.OutputDir, "checkpoint", "step-0", ".metadata")
+		t.logger.Info("Training", "Head node: copying metadata from %s to %s", sourceMetadata, destMetadata)
+	} else {
+		// Worker nodes: copy to /opt/dlami/nvme/outputs/checkpoint/step-0
+		destMetadata = filepath.Join("/opt/dlami/nvme/outputs", "checkpoint", "step-0", ".metadata")
+		t.logger.Info("Training", "Worker node: copying metadata from %s to %s", sourceMetadata, destMetadata)
 	}
 
+	// Check if source metadata exists
+	if _, err := os.Stat(sourceMetadata); os.IsNotExist(err) {
+		return fmt.Errorf("source metadata file not found: %s", sourceMetadata)
+	}
+
+	// Copy the metadata file
+	if err := copyFile(sourceMetadata, destMetadata); err != nil {
+		return fmt.Errorf("failed to copy metadata to checkpoint: %v", err)
+	}
+
+	t.logger.Info("Training", "Successfully copied metadata to checkpoint directory")
+	return nil
+}
+
+// SetupTrainingFiles prepares all necessary files for training
+func (t *TrainingManager) SetupTrainingFiles(ctx context.Context, trainingCfg *TrainingConfig) error {
 	// Use the run ID from the config (generated by orchestration)
 	runID := trainingCfg.TensorPreload.RunID
 	if runID == "" {
@@ -326,13 +342,14 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 	}
 	t.runID = runID
 
-	// If this is the head node, ensure Redis is running and copy metadata to NFS
 	if trainingCfg.Rank == 0 {
-		// Start Redis first
-		if err := ensureRedisRunning(t.logger, trainingCfg.TensorPreload.RedisPort); err != nil {
-			return fmt.Errorf("failed to ensure Redis is running: %w", err)
+		// Head node: Start Redis and copy files to NFS
+		if trainingCfg.TensorPreload.Enabled {
+			if err := ensureRedisRunning(t.logger, trainingCfg.TensorPreload.RedisPort); err != nil {
+				return fmt.Errorf("failed to ensure Redis is running: %w", err)
+			}
+			t.logger.Info("Training", "Redis server is ready on port %d", trainingCfg.TensorPreload.RedisPort)
 		}
-		t.logger.Info("Training", "Redis server is ready on port %d", trainingCfg.TensorPreload.RedisPort)
 
 		// Copy metadata file to NFS shared location
 		if err := t.copyMetadataToNFS(trainingCfg); err != nil {
@@ -348,24 +365,32 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		if err := t.copyDatasetToNFS(trainingCfg); err != nil {
 			return fmt.Errorf("failed to copy dataset to NFS: %w", err)
 		}
-	} else {
-		// For worker nodes, wait to ensure head node has Redis up and running
-		t.logger.Info("Training", "Worker node: waiting for Redis to be available on %s:%d",
-			trainingCfg.TensorPreload.RedisHost, trainingCfg.TensorPreload.RedisPort)
 
-		// Try to ping Redis to ensure it's ready
-		maxRetries := 30 // 30 seconds max wait
-		for i := 0; i < maxRetries; i++ {
-			if isRedisAvailable(trainingCfg.TensorPreload.RedisHost, trainingCfg.TensorPreload.RedisPort) {
-				t.logger.Info("Training", "Successfully connected to Redis on %s:%d",
-					trainingCfg.TensorPreload.RedisHost, trainingCfg.TensorPreload.RedisPort)
-				break
+		// Copy metadata to checkpoint directory for head node
+		if err := t.copyMetadataToCheckpoint(trainingCfg); err != nil {
+			t.logger.Warn("Training", "Failed to copy metadata to checkpoint directory: %v", err)
+			// Don't fail the entire setup for this
+		}
+	} else {
+		// Worker nodes: wait for files to be available and copy metadata to checkpoint
+		if trainingCfg.TensorPreload.Enabled {
+			// Wait for Redis to be available
+			t.logger.Info("Training", "Worker node: waiting for Redis to be available on %s:%d",
+				trainingCfg.TensorPreload.RedisHost, trainingCfg.TensorPreload.RedisPort)
+
+			maxRetries := 30 // 30 seconds max wait
+			for i := 0; i < maxRetries; i++ {
+				if isRedisAvailable(trainingCfg.TensorPreload.RedisHost, trainingCfg.TensorPreload.RedisPort) {
+					t.logger.Info("Training", "Successfully connected to Redis on %s:%d",
+						trainingCfg.TensorPreload.RedisHost, trainingCfg.TensorPreload.RedisPort)
+					break
+				}
+				if i == maxRetries-1 {
+					return fmt.Errorf("failed to connect to Redis after %d attempts", maxRetries)
+				}
+				time.Sleep(1 * time.Second)
+				t.logger.Info("Training", "Waiting for Redis server... (attempt %d/%d)", i+1, maxRetries)
 			}
-			if i == maxRetries-1 {
-				return fmt.Errorf("failed to connect to Redis after %d attempts", maxRetries)
-			}
-			time.Sleep(1 * time.Second)
-			t.logger.Info("Training", "Waiting for Redis server... (attempt %d/%d)", i+1, maxRetries)
 		}
 
 		// Wait for metadata file to be available on NFS
@@ -401,6 +426,22 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 			time.Sleep(1 * time.Second)
 			t.logger.Info("Training", "Waiting for dataset... (attempt %d/%d)", i+1, maxDatasetRetries)
 		}
+
+		// Copy metadata to checkpoint directory for worker node
+		if err := t.copyMetadataToCheckpoint(trainingCfg); err != nil {
+			t.logger.Warn("Training", "Failed to copy metadata to checkpoint directory: %v", err)
+			// Don't fail the entire setup for this
+		}
+	}
+
+	return nil
+}
+
+// StartTensorPreloader starts the tensor preloader process in a managed goroutine
+func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg *TrainingConfig) error {
+	if !trainingCfg.TensorPreload.Enabled {
+		t.logger.Info("Training", "Tensor preloading is disabled")
+		return nil
 	}
 
 	// Use a specific path for model_loader.py
@@ -425,7 +466,7 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 		"--world-size", fmt.Sprintf("%d", trainingCfg.WorldSize),
 		"--redis-host", trainingCfg.TensorPreload.RedisHost,
 		"--redis-port", fmt.Sprintf("%d", trainingCfg.TensorPreload.RedisPort),
-		"--run-id", runID,
+		"--run-id", t.runID,
 	}
 
 	// Add metadata-path for worker nodes only
@@ -588,7 +629,7 @@ set -e
 
 # Export environment variables
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-export NCCL_DEBUG=INFO
+export NCCL_DEBUG=WARN
 export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
 export NCCL_IB_DISABLE=1
 

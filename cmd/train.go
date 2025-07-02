@@ -111,6 +111,13 @@ the training process with optional tensor preloading.`,
 				trainingManager.SetTorchTitanPath(torchtitanPath)
 			}
 
+			// Setup training files (copy metadata, tokenizer, dataset to NFS and checkpoint directories)
+			logger.Info("Training", "Setting up training files...")
+			if err := trainingManager.SetupTrainingFiles(ctx, trainingCfg); err != nil {
+				return fmt.Errorf("failed to setup training files: %v", err)
+			}
+			logger.Info("Training", "Training files setup completed")
+
 			// Start tensor preloader if enabled
 			if usePreload && trainingCfg.TensorPreload.Enabled {
 				if err := trainingManager.StartTensorPreloader(ctx, trainingCfg); err != nil {
