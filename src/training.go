@@ -465,7 +465,7 @@ func (t *TrainingManager) SetupTrainingFiles(ctx context.Context, trainingCfg *T
 			if i == maxDatasetRetries-1 {
 				return fmt.Errorf("dataset not found on NFS after %d attempts", maxDatasetRetries)
 			}
-			time.Sleep(1 * time.Second)
+			time.Sleep(5 * time.Second)
 			t.logger.Info("Training", "Waiting for dataset... (attempt %d/%d)", i+1, maxDatasetRetries)
 		}
 
