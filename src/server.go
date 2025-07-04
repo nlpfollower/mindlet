@@ -48,6 +48,7 @@ func NewMindletServer(cfg *MindletConfig) (*MindletServer, error) {
 	mux.HandleFunc("/health", server.handleHealth)
 	mux.HandleFunc("/api/inference", server.handleInference)
 	mux.HandleFunc("/api/inference/stream", server.handleStreamingInference)
+	mux.HandleFunc("/api/dataset/process", server.handleDatasetProcessing)
 
 	server.httpServer = &http.Server{
 		Addr:    fmt.Sprintf(":%d", cfg.Port),
@@ -444,6 +445,63 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 
 	// Fallback response if VLLM is not enabled
 	http.Error(w, "Non-VLLM streaming inference not implemented", http.StatusNotImplemented)
+}
+
+// HandleDatasetProcessing handles HTTP requests for dataset processing
+func (s *MindletServer) handleDatasetProcessing(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ProcessDatasetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Log the request
+	if s.logger != nil {
+		s.logger.Info("MindletServer", "Received dataset processing request for dataset: %s", req.DatasetName)
+	}
+
+	// Check if VLLM is running
+	if !s.config.UseVLLM {
+		http.Error(w, "VLLM is not enabled", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Ensure we have a running VLLM server
+	if len(s.vllmManager.GetRunningServers()) == 0 {
+		http.Error(w, "No VLLM server is running", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Create dataset processor
+	processor := NewDatasetProcessor(s.vllmManager, s.logger, s.config.VLLMHost, s.config.VLLMPort)
+
+	// Process the dataset
+	ctx := r.Context()
+	resp, err := processor.ProcessDataset(ctx, &req)
+	if err != nil {
+		log.Printf("Dataset processing failed: %v", err)
+		if s.logger != nil {
+			s.logger.Error("MindletServer", "Dataset processing failed: %v", err)
+		}
+
+		errorResp := &ProcessDatasetResponse{
+			Success: false,
+			Error:   err.Error(),
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(errorResp)
+		return
+	}
+
+	// Return success response
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // Message represents a chat message
