@@ -1,8 +1,8 @@
-// mindlet/src/vllm_manager.go
 package src
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -88,6 +88,7 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 		"--host", config.Host,
 		"--port", fmt.Sprintf("%d", config.Port),
 		"--tensor-parallel-size", fmt.Sprintf("%d", config.TensorParallelSize),
+		"--disable-log-requests", // Prevent stdout blocking on large prompts
 	}
 
 	// Only add GPU memory util if specified (not 0)
@@ -116,7 +117,6 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 
 	// Set up environment for CUDA
 	cmd.Env = os.Environ()
-	// Add any necessary CUDA paths if not already in environment
 
 	// Create pipes for output
 	stdout, err := cmd.StdoutPipe()
@@ -198,6 +198,10 @@ func (m *VLLMManager) monitorServerOutput(modelID string, stdout, stderr io.Read
 	// Monitor stdout
 	go func() {
 		scanner := bufio.NewScanner(stdout)
+		// Set larger buffer for safety
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
 		for scanner.Scan() {
 			select {
 			case <-server.ctx.Done():
@@ -234,6 +238,10 @@ func (m *VLLMManager) monitorServerOutput(modelID string, stdout, stderr io.Read
 	// Monitor stderr
 	go func() {
 		scanner := bufio.NewScanner(stderr)
+		// Set larger buffer for safety
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+
 		for scanner.Scan() {
 			select {
 			case <-server.ctx.Done():
@@ -422,134 +430,45 @@ func (m *VLLMManager) findChatTemplate() string {
 	return ""
 }
 
-// saveRequestToFile saves the VLLM request to a file
-func (s *VLLMServer) saveRequestToFile(messages []Message, stream bool, maxTokens int) (string, error) {
-	// Create request
+// Forward forwards inference requests to VLLM server (non-streaming)
+func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens int) (map[string]interface{}, error) {
+	// Convert messages to VLLM format
 	vllmReq := map[string]interface{}{
 		"model":      "",
 		"messages":   messages,
-		"stream":     stream,
+		"stream":     false,
 		"max_tokens": maxTokens,
 	}
 
 	jsonData, err := json.Marshal(vllmReq)
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal request: %w", err)
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Ensure directory exists
-	requestDir := "/home/ec2-user/requests"
-	if err := os.MkdirAll(requestDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create request directory: %w", err)
-	}
-
-	// Create file with timestamp
-	timestamp := time.Now().Format("20060102_150405.000")
-	filename := fmt.Sprintf("vllm_request_%s.json", timestamp)
-	filepath := filepath.Join(requestDir, filename)
-
-	// Write request to file
-	if err := os.WriteFile(filepath, jsonData, 0644); err != nil {
-		return "", fmt.Errorf("failed to write request to file: %w", err)
-	}
-
-	log.Printf("Saved request to %s", filepath)
-	return filepath, nil
-}
-
-// executeReplayRequest runs the replay_request binary
-func (s *VLLMServer) executeReplayRequest(requestFile string, stream bool) ([]byte, error) {
-	// Look for replay_request binary in common locations
-	replayPaths := []string{
-		"/home/ec2-user/replay_request",
-		"/usr/local/bin/replay_request",
-		"/tmp/replay_request",
-		// Add the path where you compiled it
-	}
-
-	var replayPath string
-	for _, path := range replayPaths {
-		if _, err := os.Stat(path); err == nil {
-			replayPath = path
-			break
-		}
-	}
-
-	if replayPath == "" {
-		return nil, fmt.Errorf("replay_request binary not found")
-	}
-
-	// Build command
+	// Make request to VLLM
 	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
-	args := []string{
-		"-endpoint", endpoint,
-		requestFile,
-	}
-
-	if stream {
-		args = append(args, "-stream")
-	}
-
-	log.Printf("Executing: %s %s", replayPath, strings.Join(args, " "))
-
-	// Execute the command
-	cmd := exec.Command(replayPath, args...)
-	output, err := cmd.CombinedOutput()
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
 	if err != nil {
-		return output, fmt.Errorf("replay_request failed: %w, output: %s", err, string(output))
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	return output, nil
-}
+	req.Header.Set("Content-Type", "application/json")
 
-// Forward forwards inference requests to VLLM server (non-streaming)
-func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens int) (map[string]interface{}, error) {
-	// Check if context is already cancelled
-	select {
-	case <-ctx.Done():
-		return nil, fmt.Errorf("context already cancelled before request: %v", ctx.Err())
-	default:
-	}
-
-	log.Printf("Using hacky file-based approach for non-streaming request")
-
-	// Save request to file
-	requestFile, err := s.saveRequestToFile(messages, false, maxTokens)
+	client := &http.Client{Timeout: 5 * time.Minute}
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to save request: %w", err)
+		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
-	defer os.Remove(requestFile)
+	defer resp.Body.Close()
 
-	log.Printf("Saved request to %s", requestFile)
-
-	// Execute replay_request
-	output, err := s.executeReplayRequest(requestFile, false)
-	if err != nil {
-		return nil, err
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("VLLM server returned %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Parse the output to extract JSON response
-	// The output might have some log lines before the actual JSON
-	lines := strings.Split(string(output), "\n")
-	var jsonStart int
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "{") {
-			jsonStart = i
-			break
-		}
-	}
-
-	if jsonStart >= len(lines) {
-		return nil, fmt.Errorf("no JSON response found in output")
-	}
-
-	// Join the JSON lines
-	jsonOutput := strings.Join(lines[jsonStart:], "\n")
-
-	// Parse JSON response
 	var result map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonOutput), &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	return result, nil
@@ -557,89 +476,88 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens 
 
 // ForwardStream forwards streaming inference requests to VLLM server
 func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxTokens int, onChunk func(map[string]interface{}) error) error {
-	// Check if context is already cancelled
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("context already cancelled before request: %v", ctx.Err())
-	default:
+	// Convert messages to VLLM format
+	vllmReq := map[string]interface{}{
+		"model":      "",
+		"messages":   messages,
+		"stream":     true,
+		"max_tokens": maxTokens,
 	}
 
-	log.Printf("Using hacky file-based approach for streaming request")
-
-	// Save request to file
-	requestFile, err := s.saveRequestToFile(messages, true, maxTokens)
+	jsonData, err := json.Marshal(vllmReq)
 	if err != nil {
-		return fmt.Errorf("failed to save request: %w", err)
+		return fmt.Errorf("failed to marshal request: %w", err)
 	}
-	defer os.Remove(requestFile)
 
-	log.Printf("Saved streaming request to %s", requestFile)
-
-	// For streaming, we need to execute replay_request and parse its output
-	// This is more complex because we need to parse the streaming output
-
-	// Build command
+	// Make request to VLLM
 	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
-	replayPath := "./replay_request" // Adjust path as needed
-
-	cmd := exec.Command(replayPath, "-endpoint", endpoint, "-stream", requestFile)
-
-	// Get stdout pipe
-	stdout, err := cmd.StdoutPipe()
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to get stdout pipe: %w", err)
+		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Start the command
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start replay_request: %w", err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+
+	client := &http.Client{
+		// No overall timeout for streaming
+		Transport: &http.Transport{
+			MaxIdleConns:       10,
+			IdleConnTimeout:    30 * time.Second,
+			DisableCompression: true,
+			DisableKeepAlives:  true, // Prevent connection reuse issues
+		},
 	}
 
-	// Read the streaming output
-	scanner := bufio.NewScanner(stdout)
-	inStreamSection := false
-	currentContent := ""
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
 
-	for scanner.Scan() {
-		line := scanner.Text()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("VLLM server returned %d: %s", resp.StatusCode, string(body))
+	}
 
-		// Look for the streaming response marker
-		if strings.Contains(line, "--- Streaming Response ---") {
-			inStreamSection = true
+	// Read SSE stream
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("error reading stream: %w", err)
+		}
+
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
 
-		if strings.Contains(line, "[Stream completed]") {
-			break
-		}
+		// Parse SSE data
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
 
-		// If we're in the stream section, accumulate content
-		if inStreamSection && line != "" {
-			currentContent += line
-
-			// Create a fake chunk that matches VLLM format
-			chunk := map[string]interface{}{
-				"choices": []interface{}{
-					map[string]interface{}{
-						"index": 0,
-						"delta": map[string]interface{}{
-							"content": line,
-						},
-					},
-				},
+			// Check for end of stream
+			if data == "[DONE]" {
+				break
 			}
 
-			// Send the chunk
+			// Parse JSON chunk
+			var chunk map[string]interface{}
+			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+				// Log error but continue processing
+				log.Printf("Error parsing chunk: %v, data: %s", err, data)
+				continue
+			}
+
+			// Call the callback with the chunk
 			if err := onChunk(chunk); err != nil {
-				cmd.Process.Kill()
 				return fmt.Errorf("chunk handler error: %w", err)
 			}
 		}
-	}
-
-	// Wait for command to finish
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("replay_request failed: %w", err)
 	}
 
 	return nil
