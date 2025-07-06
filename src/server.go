@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -338,6 +339,10 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 		return
 	}
 
+	// Set a timeout for the entire request
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	defer cancel()
+
 	var req struct {
 		ModelID        string    `json:"model_id"`
 		Messages       []Message `json:"messages"`
@@ -351,12 +356,14 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Default model size if not specified
+	// Ensure request body is fully read and closed
+	io.Copy(io.Discard, r.Body)
+	r.Body.Close()
+
+	// Default values
 	if req.ModelSize == "" {
 		req.ModelSize = "8B"
 	}
-
-	// Default max tokens if not specified
 	if req.MaxTokens == 0 {
 		req.MaxTokens = 1500
 	}
@@ -376,9 +383,6 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 	// Switch to the requested model
 	if err := s.switchToModel(req.ModelID, checkpointPath, req.ModelSize); err != nil {
 		log.Printf("Failed to switch to model: %v", err)
-		if s.logger != nil {
-			s.logger.Error("MindletServer", "Failed to switch to model: %v", err)
-		}
 		http.Error(w, fmt.Sprintf("Failed to switch to model: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -392,15 +396,12 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 		}
 
 		log.Printf("Forwarding streaming inference to VLLM server on port %d", server.Port)
-		if s.logger != nil {
-			s.logger.Info("MindletServer", "Forwarding streaming inference to VLLM server on port %d", server.Port)
-		}
 
 		// Set up SSE headers
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no") // Disable Nginx buffering
+		w.Header().Set("X-Accel-Buffering", "no")
 
 		// Create a flusher
 		flusher, ok := w.(http.Flusher)
@@ -409,8 +410,24 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 			return
 		}
 
+		// Track if we've sent any data
+		dataSent := false
+
+		// Create a done channel to signal completion
+		done := make(chan struct{})
+		defer close(done)
+
 		// Forward the streaming request to VLLM
-		err := server.ForwardStream(r.Context(), req.Messages, req.MaxTokens, func(chunk map[string]interface{}) error {
+		err := server.ForwardStream(ctx, req.Messages, req.MaxTokens, func(chunk map[string]interface{}) error {
+			// Check if client disconnected
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("client disconnected")
+			case <-done:
+				return fmt.Errorf("handler completed")
+			default:
+			}
+
 			// Convert chunk to SSE format
 			data, err := json.Marshal(chunk)
 			if err != nil {
@@ -418,28 +435,36 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 			}
 
 			// Write SSE event
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", string(data)); err != nil {
+				return fmt.Errorf("failed to write response: %w", err)
+			}
+
 			flusher.Flush()
+			dataSent = true
 			return nil
 		})
 
 		if err != nil {
 			log.Printf("VLLM streaming inference failed: %v", err)
-			if s.logger != nil {
-				s.logger.Error("MindletServer", "VLLM streaming inference failed: %v", err)
+			// Only send error if we haven't sent any data yet
+			if !dataSent {
+				errorData := map[string]interface{}{
+					"error": err.Error(),
+				}
+				data, _ := json.Marshal(errorData)
+				fmt.Fprintf(w, "data: %s\n\n", string(data))
+				flusher.Flush()
 			}
-			// Write error as SSE event
-			errorData := map[string]interface{}{
-				"error": err.Error(),
-			}
-			data, _ := json.Marshal(errorData)
-			fmt.Fprintf(w, "data: %s\n\n", string(data))
+		}
+
+		// Always send done signal if we sent any data
+		if dataSent {
+			fmt.Fprintf(w, "data: [DONE]\n\n")
 			flusher.Flush()
 		}
 
-		// Send done signal
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		// Give client time to read the [DONE] signal
+		time.Sleep(100 * time.Millisecond)
 		return
 	}
 
