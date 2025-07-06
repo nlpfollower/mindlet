@@ -17,26 +17,6 @@ import (
 	"time"
 )
 
-// TokenizeRequest represents a request to the VLLM tokenize endpoint
-type TokenizeRequest struct {
-	Messages []Message `json:"messages"`
-}
-
-// TokenizeResponse represents the response from VLLM tokenize endpoint
-type TokenizeResponse struct {
-	Tokens []int `json:"tokens"`
-}
-
-// DetokenizeRequest represents a request to the VLLM detokenize endpoint
-type DetokenizeRequest struct {
-	Tokens []int `json:"tokens"`
-}
-
-// DetokenizeResponse represents the response from VLLM detokenize endpoint
-type DetokenizeResponse struct {
-	Prompt string `json:"prompt"`
-}
-
 type VLLMConfig struct {
 	ModelPath          string
 	ModelID            string
@@ -442,7 +422,7 @@ func (m *VLLMManager) findChatTemplate() string {
 	return ""
 }
 
-// saveRequestToFile saves the VLLM request to a temporary file
+// saveRequestToFile saves the VLLM request to a file
 func (s *VLLMServer) saveRequestToFile(messages []Message, stream bool, maxTokens int) (string, error) {
 	// Create request
 	vllmReq := map[string]interface{}{
@@ -457,27 +437,31 @@ func (s *VLLMServer) saveRequestToFile(messages []Message, stream bool, maxToken
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Create temp file
-	tmpFile, err := os.CreateTemp("/tmp", "vllm_request_*.json")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %w", err)
+	// Ensure directory exists
+	requestDir := "/home/ec2-user/requests"
+	if err := os.MkdirAll(requestDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create request directory: %w", err)
 	}
-	defer tmpFile.Close()
+
+	// Create file with timestamp
+	timestamp := time.Now().Format("20060102_150405.000")
+	filename := fmt.Sprintf("vllm_request_%s.json", timestamp)
+	filepath := filepath.Join(requestDir, filename)
 
 	// Write request to file
-	if _, err := tmpFile.Write(jsonData); err != nil {
-		os.Remove(tmpFile.Name())
+	if err := os.WriteFile(filepath, jsonData, 0644); err != nil {
 		return "", fmt.Errorf("failed to write request to file: %w", err)
 	}
 
-	return tmpFile.Name(), nil
+	log.Printf("Saved request to %s", filepath)
+	return filepath, nil
 }
 
 // executeReplayRequest runs the replay_request binary
 func (s *VLLMServer) executeReplayRequest(requestFile string, stream bool) ([]byte, error) {
 	// Look for replay_request binary in common locations
 	replayPaths := []string{
-		"./replay_request",
+		"/home/ec2-user/replay_request",
 		"/usr/local/bin/replay_request",
 		"/tmp/replay_request",
 		// Add the path where you compiled it
