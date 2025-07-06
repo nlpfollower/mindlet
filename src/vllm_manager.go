@@ -3,7 +3,6 @@ package src
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -54,26 +53,6 @@ type VLLMManager struct {
 	servers map[string]*VLLMServer
 	mu      sync.RWMutex
 	logger  *Logger
-}
-
-// TokenizeRequest represents a request to the VLLM tokenize endpoint
-type TokenizeRequest struct {
-	Messages []Message `json:"messages"`
-}
-
-// TokenizeResponse represents the response from VLLM tokenize endpoint
-type TokenizeResponse struct {
-	Tokens []int `json:"tokens"`
-}
-
-// DetokenizeRequest represents a request to the VLLM detokenize endpoint
-type DetokenizeRequest struct {
-	Tokens []int `json:"tokens"`
-}
-
-// DetokenizeResponse represents the response from VLLM detokenize endpoint
-type DetokenizeResponse struct {
-	Prompt string `json:"prompt"`
 }
 
 func NewVLLMManager(cfg *MindletConfig, logger *Logger) *VLLMManager {
@@ -443,94 +422,80 @@ func (m *VLLMManager) findChatTemplate() string {
 	return ""
 }
 
-// tokenizeMessages sends a tokenize request to get token counts for messages
-func (s *VLLMServer) tokenizeMessages(ctx context.Context, messages []Message) ([]int, error) {
-	// Create tokenize request
-	tokenReq := TokenizeRequest{
-		Messages: messages,
+// saveRequestToFile saves the VLLM request to a temporary file
+func (s *VLLMServer) saveRequestToFile(messages []Message, stream bool, maxTokens int) (string, error) {
+	// Create request
+	vllmReq := map[string]interface{}{
+		"model":      "",
+		"messages":   messages,
+		"stream":     stream,
+		"max_tokens": maxTokens,
 	}
 
-	jsonData, err := json.Marshal(tokenReq)
+	jsonData, err := json.Marshal(vllmReq)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal tokenize request: %w", err)
+		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	// Make request to VLLM tokenize endpoint
-	endpoint := fmt.Sprintf("http://%s:%d/tokenize", s.Config.Host, s.Port)
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+	// Create temp file
+	tmpFile, err := os.CreateTemp("/tmp", "vllm_request_*.json")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create tokenize request: %w", err)
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	// Write request to file
+	if _, err := tmpFile.Write(jsonData); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to write request to file: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to make tokenize request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("tokenize request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp TokenizeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to decode tokenize response: %w", err)
-	}
-
-	return tokenResp.Tokens, nil
+	return tmpFile.Name(), nil
 }
 
-// logTokenCounts tokenizes messages individually and logs token counts
-func (s *VLLMServer) logTokenCounts(ctx context.Context, messages []Message) (int, error) {
-	log.Printf("=== Token Count Analysis ===")
-
-	totalTokens := 0
-
-	// Tokenize each message individually to get per-message counts
-	for i, msg := range messages {
-		tokens, err := s.tokenizeMessages(ctx, []Message{msg})
-		if err != nil {
-			log.Printf("Failed to tokenize message %d (role: %s): %v", i+1, msg.Role, err)
-			continue
-		}
-
-		tokenCount := len(tokens)
-		totalTokens += tokenCount
-
-		// Truncate content for logging if it's too long
-		contentPreview := msg.Content
-		if len(contentPreview) > 100 {
-			contentPreview = contentPreview[:97] + "..."
-		}
-
-		log.Printf("Message %d (role: %s): %d tokens - \"%s\"",
-			i+1, msg.Role, tokenCount, contentPreview)
+// executeReplayRequest runs the replay_request binary
+func (s *VLLMServer) executeReplayRequest(requestFile string, stream bool) ([]byte, error) {
+	// Look for replay_request binary in common locations
+	replayPaths := []string{
+		"./replay_request",
+		"/usr/local/bin/replay_request",
+		"/tmp/replay_request",
+		// Add the path where you compiled it
 	}
 
-	// Also tokenize all messages together to get the actual total
-	// (which might be different due to special tokens between messages)
-	allTokens, err := s.tokenizeMessages(ctx, messages)
+	var replayPath string
+	for _, path := range replayPaths {
+		if _, err := os.Stat(path); err == nil {
+			replayPath = path
+			break
+		}
+	}
+
+	if replayPath == "" {
+		return nil, fmt.Errorf("replay_request binary not found")
+	}
+
+	// Build command
+	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
+	args := []string{
+		"-endpoint", endpoint,
+		requestFile,
+	}
+
+	if stream {
+		args = append(args, "-stream")
+	}
+
+	log.Printf("Executing: %s %s", replayPath, strings.Join(args, " "))
+
+	// Execute the command
+	cmd := exec.Command(replayPath, args...)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("Failed to tokenize all messages together: %v", err)
-		// Return the sum of individual messages as fallback
-		return totalTokens, err
+		return output, fmt.Errorf("replay_request failed: %w, output: %s", err, string(output))
 	}
 
-	actualTotal := len(allTokens)
-	log.Printf("Total tokens (all messages): %d", actualTotal)
-	if actualTotal != totalTokens {
-		log.Printf("Note: Combined tokenization differs by %d tokens (likely due to message separators)",
-			actualTotal-totalTokens)
-	}
-
-	log.Printf("=========================")
-
-	// Return the actual total from combined tokenization
-	return actualTotal, nil
+	return output, nil
 }
 
 // Forward forwards inference requests to VLLM server (non-streaming)
@@ -542,91 +507,45 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens 
 	default:
 	}
 
-	// Log token counts before sending inference request
-	_, err := s.logTokenCounts(ctx, messages)
+	log.Printf("Using hacky file-based approach for non-streaming request")
+
+	// Save request to file
+	requestFile, err := s.saveRequestToFile(messages, false, maxTokens)
 	if err != nil {
-		return nil, fmt.Errorf("token count check failed: %w", err)
+		return nil, fmt.Errorf("failed to save request: %w", err)
 	}
+	defer os.Remove(requestFile)
 
-	// Convert messages to VLLM format
-	vllmReq := map[string]interface{}{
-		"model":      "",
-		"messages":   messages,
-		"stream":     false,
-		"max_tokens": maxTokens,
-	}
+	log.Printf("Saved request to %s", requestFile)
 
-	jsonData, err := json.Marshal(vllmReq)
+	// Execute replay_request
+	output, err := s.executeReplayRequest(requestFile, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, err
 	}
 
-	// Log request details
-	log.Printf("Non-streaming inference request size: %d bytes (%.2f MB)",
-		len(jsonData), float64(len(jsonData))/(1024*1024))
-
-	// Make request to VLLM
-	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
-
-	// CRITICAL: Use context.Background() for HTTP request to prevent cancellation
-	// Keep original context for monitoring
-	httpReq, err := http.NewRequestWithContext(context.Background(), "POST", endpoint, bytes.NewReader(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.ContentLength = int64(len(jsonData))
-
-	// Create client with proper settings
-	client := &http.Client{
-		Timeout: 5 * time.Minute,
-		Transport: &http.Transport{
-			MaxIdleConns:           100,
-			MaxIdleConnsPerHost:    100,
-			IdleConnTimeout:        90 * time.Second,
-			ResponseHeaderTimeout:  5 * time.Minute,
-			ExpectContinueTimeout:  1 * time.Second,
-			MaxResponseHeaderBytes: 1 << 20, // 1 MB
-			WriteBufferSize:        1 << 20, // 1 MB
-			ReadBufferSize:         1 << 20, // 1 MB
-			DisableCompression:     true,
-		},
-	}
-
-	log.Printf("Sending non-streaming request to VLLM at %s", endpoint)
-	startTime := time.Now()
-
-	// Monitor original context cancellation in background
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			log.Printf("WARNING: Original context cancelled during non-streaming request: %v", ctx.Err())
-		case <-done:
-			// Request completed normally
+	// Parse the output to extract JSON response
+	// The output might have some log lines before the actual JSON
+	lines := strings.Split(string(output), "\n")
+	var jsonStart int
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "{") {
+			jsonStart = i
+			break
 		}
-	}()
-
-	resp, err := client.Do(httpReq)
-	close(done) // Signal that request completed
-
-	if err != nil {
-		log.Printf("Non-streaming request failed after %v: %v", time.Since(startTime), err)
-		return nil, fmt.Errorf("failed to make request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	log.Printf("Got non-streaming response after %v, status: %d", time.Since(startTime), resp.StatusCode)
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("VLLM server returned %d: %s", resp.StatusCode, string(body))
 	}
 
+	if jsonStart >= len(lines) {
+		return nil, fmt.Errorf("no JSON response found in output")
+	}
+
+	// Join the JSON lines
+	jsonOutput := strings.Join(lines[jsonStart:], "\n")
+
+	// Parse JSON response
 	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+	if err := json.Unmarshal([]byte(jsonOutput), &result); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	return result, nil
@@ -641,138 +560,83 @@ func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxT
 	default:
 	}
 
-	// Log token counts before sending inference request
-	_, err := s.logTokenCounts(ctx, messages)
+	log.Printf("Using hacky file-based approach for streaming request")
+
+	// Save request to file
+	requestFile, err := s.saveRequestToFile(messages, true, maxTokens)
 	if err != nil {
-		return fmt.Errorf("token count check failed: %w", err)
+		return fmt.Errorf("failed to save request: %w", err)
 	}
+	defer os.Remove(requestFile)
 
-	// Convert messages to VLLM format
-	vllmReq := map[string]interface{}{
-		"model":      "",
-		"messages":   messages,
-		"stream":     true,
-		"max_tokens": maxTokens,
-	}
+	log.Printf("Saved streaming request to %s", requestFile)
 
-	jsonData, err := json.Marshal(vllmReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
+	// For streaming, we need to execute replay_request and parse its output
+	// This is more complex because we need to parse the streaming output
 
-	// Log request details
-	log.Printf("Streaming inference request size: %d bytes (%.2f MB)",
-		len(jsonData), float64(len(jsonData))/(1024*1024))
-
-	// Make request to VLLM
+	// Build command
 	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
+	replayPath := "./replay_request" // Adjust path as needed
 
-	// CRITICAL: Use context.Background() for HTTP request to prevent cancellation
-	// This matches the pattern in session.go and prevents context cancellation issues
-	httpReq, err := http.NewRequestWithContext(context.Background(), "POST", endpoint, bytes.NewReader(jsonData))
+	cmd := exec.Command(replayPath, "-endpoint", endpoint, "-stream", requestFile)
+
+	// Get stdout pipe
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.ContentLength = int64(len(jsonData))
-
-	// Create client with same settings as standalone version
-	client := &http.Client{
-		Timeout: 10 * time.Minute,
-		Transport: &http.Transport{
-			MaxIdleConns:           100,
-			MaxIdleConnsPerHost:    100,
-			IdleConnTimeout:        90 * time.Second,
-			ResponseHeaderTimeout:  5 * time.Minute,
-			ExpectContinueTimeout:  1 * time.Second,
-			MaxResponseHeaderBytes: 1 << 20, // 1 MB
-			WriteBufferSize:        1 << 20, // 1 MB
-			ReadBufferSize:         1 << 20, // 1 MB
-			DisableCompression:     true,
-		},
+	// Start the command
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start replay_request: %w", err)
 	}
 
-	log.Printf("Sending streaming request to VLLM at %s", endpoint)
-	startTime := time.Now()
+	// Read the streaming output
+	scanner := bufio.NewScanner(stdout)
+	inStreamSection := false
+	currentContent := ""
 
-	// Optional: Save request for debugging
-	if debugPath := os.Getenv("VLLM_DEBUG_PATH"); debugPath != "" {
-		debugFile := fmt.Sprintf("%s/vllm_request_%d.json", debugPath, time.Now().Unix())
-		if err := os.WriteFile(debugFile, jsonData, 0644); err == nil {
-			log.Printf("DEBUG: Saved request to %s", debugFile)
-		}
-	}
+	for scanner.Scan() {
+		line := scanner.Text()
 
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		log.Printf("Streaming request failed after %v: %v", time.Since(startTime), err)
-		return fmt.Errorf("failed to make request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	log.Printf("Got streaming response after %v, status: %d", time.Since(startTime), resp.StatusCode)
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("VLLM server returned %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Read SSE stream
-	reader := bufio.NewReader(resp.Body)
-	chunkCount := 0
-
-	for {
-		// Check if original context is cancelled (for clean shutdown)
-		select {
-		case <-ctx.Done():
-			log.Printf("Original context cancelled during streaming (after %d chunks)", chunkCount)
-			return ctx.Err()
-		default:
-		}
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				log.Printf("Stream ended normally after %d chunks", chunkCount)
-				break
-			}
-			return fmt.Errorf("error reading stream after %d chunks: %w", chunkCount, err)
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
+		// Look for the streaming response marker
+		if strings.Contains(line, "--- Streaming Response ---") {
+			inStreamSection = true
 			continue
 		}
 
-		// Parse SSE data
-		if strings.HasPrefix(line, "data: ") {
-			data := strings.TrimPrefix(line, "data: ")
+		if strings.Contains(line, "[Stream completed]") {
+			break
+		}
 
-			// Check for end of stream
-			if data == "[DONE]" {
-				log.Printf("Received [DONE] signal after %d chunks", chunkCount)
-				break
+		// If we're in the stream section, accumulate content
+		if inStreamSection && line != "" {
+			currentContent += line
+
+			// Create a fake chunk that matches VLLM format
+			chunk := map[string]interface{}{
+				"choices": []interface{}{
+					map[string]interface{}{
+						"index": 0,
+						"delta": map[string]interface{}{
+							"content": line,
+						},
+					},
+				},
 			}
 
-			// Parse JSON chunk
-			var chunk map[string]interface{}
-			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				log.Printf("Error parsing chunk %d: %v, data: %s", chunkCount, err, data)
-				continue
-			}
-
-			chunkCount++
-
-			// Call the callback with the chunk
+			// Send the chunk
 			if err := onChunk(chunk); err != nil {
-				return fmt.Errorf("chunk handler error at chunk %d: %w", chunkCount, err)
+				cmd.Process.Kill()
+				return fmt.Errorf("chunk handler error: %w", err)
 			}
 		}
 	}
 
-	log.Printf("Stream processing completed successfully after %d chunks, total time: %v",
-		chunkCount, time.Since(startTime))
+	// Wait for command to finish
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("replay_request failed: %w", err)
+	}
+
 	return nil
 }
