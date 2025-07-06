@@ -274,7 +274,7 @@ func (s *MindletServer) handleInference(w http.ResponseWriter, r *http.Request) 
 
 	// Default max tokens if not specified
 	if req.MaxTokens == 0 {
-		req.MaxTokens = 300
+		req.MaxTokens = 1500
 	}
 
 	log.Printf("Received inference request for model: %s (size: %s)", req.ModelID, req.ModelSize)

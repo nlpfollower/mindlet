@@ -1,4 +1,3 @@
-// mindlet/src/dataset_handler.go
 package src
 
 import (

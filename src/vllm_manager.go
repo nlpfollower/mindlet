@@ -485,7 +485,7 @@ func (s *VLLMServer) tokenizeMessages(ctx context.Context, messages []Message) (
 }
 
 // logTokenCounts tokenizes messages individually and logs token counts
-func (s *VLLMServer) logTokenCounts(ctx context.Context, messages []Message) {
+func (s *VLLMServer) logTokenCounts(ctx context.Context, messages []Message) (int, error) {
 	log.Printf("=== Token Count Analysis ===")
 
 	totalTokens := 0
@@ -516,21 +516,37 @@ func (s *VLLMServer) logTokenCounts(ctx context.Context, messages []Message) {
 	allTokens, err := s.tokenizeMessages(ctx, messages)
 	if err != nil {
 		log.Printf("Failed to tokenize all messages together: %v", err)
-	} else {
-		log.Printf("Total tokens (all messages): %d", len(allTokens))
-		if len(allTokens) != totalTokens {
-			log.Printf("Note: Combined tokenization differs by %d tokens (likely due to message separators)",
-				len(allTokens)-totalTokens)
-		}
+		// Return the sum of individual messages as fallback
+		return totalTokens, err
+	}
+
+	actualTotal := len(allTokens)
+	log.Printf("Total tokens (all messages): %d", actualTotal)
+	if actualTotal != totalTokens {
+		log.Printf("Note: Combined tokenization differs by %d tokens (likely due to message separators)",
+			actualTotal-totalTokens)
 	}
 
 	log.Printf("=========================")
+
+	// Return the actual total from combined tokenization
+	return actualTotal, nil
 }
 
 // Forward forwards inference requests to VLLM server (non-streaming)
 func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens int) (map[string]interface{}, error) {
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		return nil, fmt.Errorf("context already cancelled before request: %v", ctx.Err())
+	default:
+	}
+
 	// Log token counts before sending inference request
-	s.logTokenCounts(ctx, messages)
+	_, err := s.logTokenCounts(ctx, messages)
+	if err != nil {
+		return nil, fmt.Errorf("token count check failed: %w", err)
+	}
 
 	// Convert messages to VLLM format
 	vllmReq := map[string]interface{}{
@@ -545,21 +561,63 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens 
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Log request details
+	log.Printf("Non-streaming inference request size: %d bytes (%.2f MB)",
+		len(jsonData), float64(len(jsonData))/(1024*1024))
+
 	// Make request to VLLM
 	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+
+	// CRITICAL: Use context.Background() for HTTP request to prevent cancellation
+	// Keep original context for monitoring
+	httpReq, err := http.NewRequestWithContext(context.Background(), "POST", endpoint, bytes.NewReader(jsonData))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.ContentLength = int64(len(jsonData))
 
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
+	// Create client with proper settings
+	client := &http.Client{
+		Timeout: 5 * time.Minute,
+		Transport: &http.Transport{
+			MaxIdleConns:           100,
+			MaxIdleConnsPerHost:    100,
+			IdleConnTimeout:        90 * time.Second,
+			ResponseHeaderTimeout:  5 * time.Minute,
+			ExpectContinueTimeout:  1 * time.Second,
+			MaxResponseHeaderBytes: 1 << 20, // 1 MB
+			WriteBufferSize:        1 << 20, // 1 MB
+			ReadBufferSize:         1 << 20, // 1 MB
+			DisableCompression:     true,
+		},
+	}
+
+	log.Printf("Sending non-streaming request to VLLM at %s", endpoint)
+	startTime := time.Now()
+
+	// Monitor original context cancellation in background
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Printf("WARNING: Original context cancelled during non-streaming request: %v", ctx.Err())
+		case <-done:
+			// Request completed normally
+		}
+	}()
+
+	resp, err := client.Do(httpReq)
+	close(done) // Signal that request completed
+
 	if err != nil {
+		log.Printf("Non-streaming request failed after %v: %v", time.Since(startTime), err)
 		return nil, fmt.Errorf("failed to make request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	log.Printf("Got non-streaming response after %v, status: %d", time.Since(startTime), resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -576,14 +634,24 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens 
 
 // ForwardStream forwards streaming inference requests to VLLM server
 func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxTokens int, onChunk func(map[string]interface{}) error) error {
+	// Check if context is already cancelled
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("context already cancelled before request: %v", ctx.Err())
+	default:
+	}
+
 	// Log token counts before sending inference request
-	s.logTokenCounts(ctx, messages)
+	_, err := s.logTokenCounts(ctx, messages)
+	if err != nil {
+		return fmt.Errorf("token count check failed: %w", err)
+	}
 
 	// Convert messages to VLLM format
 	vllmReq := map[string]interface{}{
 		"model":      "",
 		"messages":   messages,
-		"stream":     true, // Enable streaming
+		"stream":     true,
 		"max_tokens": maxTokens,
 	}
 
@@ -592,22 +660,59 @@ func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxT
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	// Log request details
+	log.Printf("Streaming inference request size: %d bytes (%.2f MB)",
+		len(jsonData), float64(len(jsonData))/(1024*1024))
+
 	// Make request to VLLM
 	endpoint := fmt.Sprintf("http://%s:%d/v1/chat/completions", s.Config.Host, s.Port)
-	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+
+	// CRITICAL: Use context.Background() for HTTP request to prevent cancellation
+	// This matches the pattern in session.go and prevents context cancellation issues
+	httpReq, err := http.NewRequestWithContext(context.Background(), "POST", endpoint, bytes.NewReader(jsonData))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	httpReq.ContentLength = int64(len(jsonData))
 
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Do(req)
+	// Create client with same settings as standalone version
+	client := &http.Client{
+		Timeout: 10 * time.Minute,
+		Transport: &http.Transport{
+			MaxIdleConns:           100,
+			MaxIdleConnsPerHost:    100,
+			IdleConnTimeout:        90 * time.Second,
+			ResponseHeaderTimeout:  5 * time.Minute,
+			ExpectContinueTimeout:  1 * time.Second,
+			MaxResponseHeaderBytes: 1 << 20, // 1 MB
+			WriteBufferSize:        1 << 20, // 1 MB
+			ReadBufferSize:         1 << 20, // 1 MB
+			DisableCompression:     true,
+		},
+	}
+
+	log.Printf("Sending streaming request to VLLM at %s", endpoint)
+	startTime := time.Now()
+
+	// Optional: Save request for debugging
+	if debugPath := os.Getenv("VLLM_DEBUG_PATH"); debugPath != "" {
+		debugFile := fmt.Sprintf("%s/vllm_request_%d.json", debugPath, time.Now().Unix())
+		if err := os.WriteFile(debugFile, jsonData, 0644); err == nil {
+			log.Printf("DEBUG: Saved request to %s", debugFile)
+		}
+	}
+
+	resp, err := client.Do(httpReq)
 	if err != nil {
+		log.Printf("Streaming request failed after %v: %v", time.Since(startTime), err)
 		return fmt.Errorf("failed to make request: %w", err)
 	}
 	defer resp.Body.Close()
+
+	log.Printf("Got streaming response after %v, status: %d", time.Since(startTime), resp.StatusCode)
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -616,13 +721,24 @@ func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxT
 
 	// Read SSE stream
 	reader := bufio.NewReader(resp.Body)
+	chunkCount := 0
+
 	for {
+		// Check if original context is cancelled (for clean shutdown)
+		select {
+		case <-ctx.Done():
+			log.Printf("Original context cancelled during streaming (after %d chunks)", chunkCount)
+			return ctx.Err()
+		default:
+		}
+
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
+				log.Printf("Stream ended normally after %d chunks", chunkCount)
 				break
 			}
-			return fmt.Errorf("error reading stream: %w", err)
+			return fmt.Errorf("error reading stream after %d chunks: %w", chunkCount, err)
 		}
 
 		line = strings.TrimSpace(line)
@@ -636,23 +752,27 @@ func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxT
 
 			// Check for end of stream
 			if data == "[DONE]" {
+				log.Printf("Received [DONE] signal after %d chunks", chunkCount)
 				break
 			}
 
 			// Parse JSON chunk
 			var chunk map[string]interface{}
 			if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-				// Log error but continue processing
-				log.Printf("Error parsing chunk: %v, data: %s", err, data)
+				log.Printf("Error parsing chunk %d: %v, data: %s", chunkCount, err, data)
 				continue
 			}
 
+			chunkCount++
+
 			// Call the callback with the chunk
 			if err := onChunk(chunk); err != nil {
-				return fmt.Errorf("chunk handler error: %w", err)
+				return fmt.Errorf("chunk handler error at chunk %d: %w", chunkCount, err)
 			}
 		}
 	}
 
+	log.Printf("Stream processing completed successfully after %d chunks, total time: %v",
+		chunkCount, time.Since(startTime))
 	return nil
 }
