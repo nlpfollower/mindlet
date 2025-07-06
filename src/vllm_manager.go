@@ -56,6 +56,26 @@ type VLLMManager struct {
 	logger  *Logger
 }
 
+// TokenizeRequest represents a request to the VLLM tokenize endpoint
+type TokenizeRequest struct {
+	Messages []Message `json:"messages"`
+}
+
+// TokenizeResponse represents the response from VLLM tokenize endpoint
+type TokenizeResponse struct {
+	Tokens []int `json:"tokens"`
+}
+
+// DetokenizeRequest represents a request to the VLLM detokenize endpoint
+type DetokenizeRequest struct {
+	Tokens []int `json:"tokens"`
+}
+
+// DetokenizeResponse represents the response from VLLM detokenize endpoint
+type DetokenizeResponse struct {
+	Prompt string `json:"prompt"`
+}
+
 func NewVLLMManager(cfg *MindletConfig, logger *Logger) *VLLMManager {
 	return &VLLMManager{
 		config:  cfg,
@@ -423,8 +443,95 @@ func (m *VLLMManager) findChatTemplate() string {
 	return ""
 }
 
+// tokenizeMessages sends a tokenize request to get token counts for messages
+func (s *VLLMServer) tokenizeMessages(ctx context.Context, messages []Message) ([]int, error) {
+	// Create tokenize request
+	tokenReq := TokenizeRequest{
+		Messages: messages,
+	}
+
+	jsonData, err := json.Marshal(tokenReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal tokenize request: %w", err)
+	}
+
+	// Make request to VLLM tokenize endpoint
+	endpoint := fmt.Sprintf("http://%s:%d/tokenize", s.Config.Host, s.Port)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tokenize request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make tokenize request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("tokenize request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp TokenizeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return nil, fmt.Errorf("failed to decode tokenize response: %w", err)
+	}
+
+	return tokenResp.Tokens, nil
+}
+
+// logTokenCounts tokenizes messages individually and logs token counts
+func (s *VLLMServer) logTokenCounts(ctx context.Context, messages []Message) {
+	log.Printf("=== Token Count Analysis ===")
+
+	totalTokens := 0
+
+	// Tokenize each message individually to get per-message counts
+	for i, msg := range messages {
+		tokens, err := s.tokenizeMessages(ctx, []Message{msg})
+		if err != nil {
+			log.Printf("Failed to tokenize message %d (role: %s): %v", i+1, msg.Role, err)
+			continue
+		}
+
+		tokenCount := len(tokens)
+		totalTokens += tokenCount
+
+		// Truncate content for logging if it's too long
+		contentPreview := msg.Content
+		if len(contentPreview) > 100 {
+			contentPreview = contentPreview[:97] + "..."
+		}
+
+		log.Printf("Message %d (role: %s): %d tokens - \"%s\"",
+			i+1, msg.Role, tokenCount, contentPreview)
+	}
+
+	// Also tokenize all messages together to get the actual total
+	// (which might be different due to special tokens between messages)
+	allTokens, err := s.tokenizeMessages(ctx, messages)
+	if err != nil {
+		log.Printf("Failed to tokenize all messages together: %v", err)
+	} else {
+		log.Printf("Total tokens (all messages): %d", len(allTokens))
+		if len(allTokens) != totalTokens {
+			log.Printf("Note: Combined tokenization differs by %d tokens (likely due to message separators)",
+				len(allTokens)-totalTokens)
+		}
+	}
+
+	log.Printf("=========================")
+}
+
 // Forward forwards inference requests to VLLM server (non-streaming)
 func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens int) (map[string]interface{}, error) {
+	// Log token counts before sending inference request
+	s.logTokenCounts(ctx, messages)
+
 	// Convert messages to VLLM format
 	vllmReq := map[string]interface{}{
 		"model":      "",
@@ -469,6 +576,9 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens 
 
 // ForwardStream forwards streaming inference requests to VLLM server
 func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxTokens int, onChunk func(map[string]interface{}) error) error {
+	// Log token counts before sending inference request
+	s.logTokenCounts(ctx, messages)
+
 	// Convert messages to VLLM format
 	vllmReq := map[string]interface{}{
 		"model":      "",

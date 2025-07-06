@@ -49,26 +49,6 @@ type TrainingDataset struct {
 	TrainingPrompt  string    `json:"training_prompt"`
 }
 
-// TokenizeRequest represents a request to the VLLM tokenize endpoint
-type TokenizeRequest struct {
-	Messages []Message `json:"messages"`
-}
-
-// TokenizeResponse represents the response from VLLM tokenize endpoint
-type TokenizeResponse struct {
-	Tokens []int `json:"tokens"`
-}
-
-// DetokenizeRequest represents a request to the VLLM detokenize endpoint
-type DetokenizeRequest struct {
-	Tokens []int `json:"tokens"`
-}
-
-// DetokenizeResponse represents the response from VLLM detokenize endpoint
-type DetokenizeResponse struct {
-	Prompt string `json:"prompt"`
-}
-
 // TrainingSample represents a single training sample
 type TrainingSample struct {
 	Prompt   string
