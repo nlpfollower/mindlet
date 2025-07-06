@@ -191,7 +191,7 @@ func (dp *DatasetManager) tokenizeMessage(ctx context.Context, msg Message) ([]i
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make tokenize request: %w", err)
@@ -293,7 +293,7 @@ func (dp *DatasetManager) detokenize(ctx context.Context, tokens []int) (string,
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to make detokenize request: %w", err)
@@ -401,7 +401,7 @@ func (dp *DatasetManager) generateLearningNotes(ctx context.Context, prompt stri
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 2 * time.Minute}
+	client := &http.Client{Timeout: 60 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to make inference request: %w", err)

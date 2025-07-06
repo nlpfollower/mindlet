@@ -89,7 +89,7 @@ func (s *MindletServer) Start(ctx context.Context) error {
 	}
 
 	// Shutdown
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 60*time.Minute)
 	defer cancel()
 
 	// Stop VLLM if running
@@ -339,8 +339,8 @@ func (s *MindletServer) handleStreamingInference(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Set a timeout for the entire request
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
+	// Set a timeout for the entire request - extended to 60 minutes
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Minute)
 	defer cancel()
 
 	var req struct {

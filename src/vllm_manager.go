@@ -159,7 +159,7 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 	// Monitor server startup in background with context
 	go m.monitorServerStartup(modelID, server)
 
-	// Wait for server to be ready with timeout
+	// Wait for server to be ready with timeout - extended to 60 minutes
 	log.Printf("Waiting for VLLM server to be ready...")
 	if m.logger != nil {
 		m.logger.Info("VLLMManager", "Waiting for VLLM server to be ready...")
@@ -175,7 +175,7 @@ func (m *VLLMManager) StartServer(modelID string, config VLLMConfig) error {
 	case <-ctx.Done():
 		// Server was stopped while starting
 		return fmt.Errorf("VLLM server startup cancelled")
-	case <-time.After(5 * time.Minute):
+	case <-time.After(60 * time.Minute):
 		// Print startup logs for debugging
 		server.mu.Lock()
 		logs := server.StartupLogs
@@ -304,7 +304,7 @@ func (m *VLLMManager) StopServer(modelID string) error {
 		select {
 		case <-done:
 			// Process exited gracefully
-		case <-time.After(10 * time.Second):
+		case <-time.After(60 * time.Second):
 			// Force kill after timeout
 			server.Process.Process.Kill()
 		}
@@ -372,7 +372,7 @@ func (m *VLLMManager) monitorServerStartup(modelID string, server *VLLMServer) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	timeout := time.After(5 * time.Minute)
+	timeout := time.After(60 * time.Minute)
 
 	for {
 		select {
@@ -454,7 +454,7 @@ func (s *VLLMServer) Forward(ctx context.Context, messages []Message, maxTokens 
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 5 * time.Minute}
+	client := &http.Client{Timeout: 60 * time.Minute}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to make request: %w", err)
@@ -503,7 +503,7 @@ func (s *VLLMServer) ForwardStream(ctx context.Context, messages []Message, maxT
 		// No overall timeout for streaming
 		Transport: &http.Transport{
 			MaxIdleConns:       10,
-			IdleConnTimeout:    30 * time.Second,
+			IdleConnTimeout:    60 * time.Second,
 			DisableCompression: true,
 			DisableKeepAlives:  true, // Prevent connection reuse issues
 		},
