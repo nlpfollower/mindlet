@@ -783,10 +783,10 @@ cd %s
 				t.logger.Info("Training", "Training script completed successfully")
 
 				// Restore original metadata on head node
-				if restoreErr := t.restoreOriginalMetadata(trainingCfg); restoreErr != nil {
-					t.logger.Error("Training", "Failed to restore original metadata: %v", restoreErr)
-					// Don't fail the entire training for this
-				}
+				//if restoreErr := t.restoreOriginalMetadata(trainingCfg); restoreErr != nil {
+				//	t.logger.Error("Training", "Failed to restore original metadata: %v", restoreErr)
+				//	// Don't fail the entire training for this
+				//}
 
 				// Move checkpoint after successful completion
 				if moveErr := t.moveCheckpointToDCP(trainingCfg); moveErr != nil {
