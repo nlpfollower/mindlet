@@ -221,6 +221,36 @@ func copyFile(src, dst string) error {
 	return nil
 }
 
+// copyDirectory recursively copies a directory
+func copyDirectory(src, dst string) error {
+	// Create destination directory
+	if err := os.MkdirAll(dst, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %v", err)
+	}
+
+	// Walk through source directory
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Calculate destination path
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dst, relPath)
+
+		// If it's a directory, create it
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+
+		// If it's a file, copy it
+		return copyFile(path, dstPath)
+	})
+}
+
 // copyMetadataToNFS copies the metadata file from model path to NFS shared location
 func (t *TrainingManager) copyMetadataToNFS(trainingCfg *TrainingConfig) error {
 	// Source metadata file
@@ -577,6 +607,124 @@ func (t *TrainingManager) StartTensorPreloader(ctx context.Context, trainingCfg 
 	return nil
 }
 
+// copyWorkerCheckpointToNFS copies worker checkpoint to NFS final directory
+func (t *TrainingManager) copyWorkerCheckpointToNFS(trainingCfg *TrainingConfig) error {
+	// Source checkpoint directory
+	sourceDir := "/opt/dlami/nvme/outputs/checkpoint/step-final"
+
+	// Destination on NFS
+	destDir := filepath.Join(trainingCfg.NFSPath, "final", fmt.Sprintf("rank%d", trainingCfg.Rank))
+
+	t.logger.Info("Training", "Worker rank %d: copying checkpoint from %s to %s", trainingCfg.Rank, sourceDir, destDir)
+
+	// Check if source exists
+	if _, err := os.Stat(sourceDir); os.IsNotExist(err) {
+		return fmt.Errorf("source checkpoint not found: %s", sourceDir)
+	}
+
+	// Create destination directory
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %v", err)
+	}
+
+	// Copy the checkpoint directory
+	if err := copyDirectory(sourceDir, destDir); err != nil {
+		return fmt.Errorf("failed to copy checkpoint: %v", err)
+	}
+
+	// Create done file
+	doneFile := filepath.Join(trainingCfg.NFSPath, "final", fmt.Sprintf("rank%d", trainingCfg.Rank), fmt.Sprintf("done_%s", trainingCfg.TensorPreload.RunID))
+	if err := os.WriteFile(doneFile, []byte(fmt.Sprintf("Rank %d completed at %s\n", trainingCfg.Rank, time.Now().Format(time.RFC3339))), 0644); err != nil {
+		return fmt.Errorf("failed to create done file: %v", err)
+	}
+
+	t.logger.Info("Training", "Worker rank %d: successfully copied checkpoint to NFS and created done file", trainingCfg.Rank)
+	return nil
+}
+
+// waitForAllRanksAndConsolidate waits for all ranks to finish and consolidates checkpoints
+func (t *TrainingManager) waitForAllRanksAndConsolidate(trainingCfg *TrainingConfig, dcpDir string) error {
+	t.logger.Info("Training", "Head node: waiting for all %d ranks to complete checkpoint copy", trainingCfg.WorldSize)
+
+	// Wait for all done files
+	maxWaitTime := 30 * time.Minute // 30 minutes max wait
+	checkInterval := 10 * time.Second
+	startTime := time.Now()
+
+	for {
+		allDone := true
+		completedRanks := 0
+
+		// Check for done files for all ranks
+		for rank := 0; rank < trainingCfg.WorldSize; rank++ {
+			doneFile := filepath.Join(trainingCfg.NFSPath, "final", fmt.Sprintf("rank%d", rank), fmt.Sprintf("done_%s", trainingCfg.TensorPreload.RunID))
+			if _, err := os.Stat(doneFile); os.IsNotExist(err) {
+				allDone = false
+				t.logger.Info("Training", "Still waiting for rank %d", rank)
+			} else {
+				completedRanks++
+			}
+		}
+
+		if allDone {
+			t.logger.Info("Training", "All ranks have completed checkpoint copy")
+			break
+		}
+
+		// Check timeout
+		if time.Since(startTime) > maxWaitTime {
+			return fmt.Errorf("timeout waiting for all ranks to complete (completed: %d/%d)", completedRanks, trainingCfg.WorldSize)
+		}
+
+		t.logger.Info("Training", "Completed ranks: %d/%d, waiting %v before next check", completedRanks, trainingCfg.WorldSize, checkInterval)
+		time.Sleep(checkInterval)
+	}
+
+	// Now consolidate all worker checkpoints into the DCP directory
+	for rank := 1; rank < trainingCfg.WorldSize; rank++ {
+		sourceDir := filepath.Join(trainingCfg.NFSPath, "final", fmt.Sprintf("rank%d", rank))
+		t.logger.Info("Training", "Copying checkpoint files from rank %d at %s to %s", rank, sourceDir, dcpDir)
+
+		// Copy all files from the rank directory to DCP
+		err := filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			// Skip the done file
+			if strings.HasPrefix(info.Name(), "done_") {
+				return nil
+			}
+
+			// Calculate relative path
+			relPath, err := filepath.Rel(sourceDir, path)
+			if err != nil {
+				return err
+			}
+
+			// Destination path in DCP
+			destPath := filepath.Join(dcpDir, relPath)
+
+			// If it's a directory, create it
+			if info.IsDir() {
+				return os.MkdirAll(destPath, info.Mode())
+			}
+
+			// If it's a file, copy it
+			return copyFile(path, destPath)
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to copy rank %d checkpoint: %v", rank, err)
+		}
+
+		t.logger.Info("Training", "Successfully copied checkpoint files from rank %d", rank)
+	}
+
+	t.logger.Info("Training", "Successfully consolidated all checkpoint files into DCP directory")
+	return nil
+}
+
 // moveCheckpointToDCP moves the final checkpoint to the DCP directory
 func (t *TrainingManager) moveCheckpointToDCP(trainingCfg *TrainingConfig) error {
 	if trainingCfg.ModelName == "" {
@@ -584,12 +732,13 @@ func (t *TrainingManager) moveCheckpointToDCP(trainingCfg *TrainingConfig) error
 		return nil
 	}
 
-	// Only perform on head node (rank 0)
+	// Non-head nodes copy to NFS
 	if trainingCfg.Rank != 0 {
-		t.logger.Info("Training", "Skipping checkpoint move on worker node (rank %d)", trainingCfg.Rank)
-		return nil
+		t.logger.Info("Training", "Worker node (rank %d): copying checkpoint to NFS", trainingCfg.Rank)
+		return t.copyWorkerCheckpointToNFS(trainingCfg)
 	}
 
+	// Head node processing
 	// Extract base DCP directory from model path
 	// Model path looks like: /mnt/cold/contents/dcp/llama-8b/checkpoint/step-0
 	// We need to go up 3 levels to get to /mnt/cold/contents/dcp
@@ -602,7 +751,7 @@ func (t *TrainingManager) moveCheckpointToDCP(trainingCfg *TrainingConfig) error
 	destBaseDir := filepath.Join(dcpBaseDir, trainingCfg.ModelName, "checkpoint")
 	destPath := filepath.Join(destBaseDir, "step-0")
 
-	t.logger.Info("Training", "Moving checkpoint from %s to %s", sourcePath, destPath)
+	t.logger.Info("Training", "Moving head node checkpoint from %s to %s", sourcePath, destPath)
 
 	// Check if source exists
 	if _, err := os.Stat(sourcePath); os.IsNotExist(err) {
@@ -627,7 +776,15 @@ func (t *TrainingManager) moveCheckpointToDCP(trainingCfg *TrainingConfig) error
 		return fmt.Errorf("failed to move checkpoint: %v", err)
 	}
 
-	t.logger.Info("Training", "Successfully moved checkpoint to %s", destPath)
+	t.logger.Info("Training", "Successfully moved head node checkpoint to %s", destPath)
+
+	// If world size > 1, wait for other ranks and consolidate
+	if trainingCfg.WorldSize > 1 {
+		if err := t.waitForAllRanksAndConsolidate(trainingCfg, destPath); err != nil {
+			return fmt.Errorf("failed to consolidate checkpoints: %v", err)
+		}
+	}
+
 	return nil
 }
 
