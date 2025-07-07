@@ -656,7 +656,7 @@ func (t *TrainingManager) waitForAllRanksAndConsolidate(trainingCfg *TrainingCon
 		completedRanks := 0
 
 		// Check for done files for all ranks
-		for rank := 0; rank < trainingCfg.WorldSize; rank++ {
+		for rank := 1; rank < trainingCfg.WorldSize; rank++ {
 			doneFile := filepath.Join(trainingCfg.NFSPath, "final", fmt.Sprintf("rank%d", rank), fmt.Sprintf("done_%s", trainingCfg.TensorPreload.RunID))
 			if _, err := os.Stat(doneFile); os.IsNotExist(err) {
 				allDone = false
